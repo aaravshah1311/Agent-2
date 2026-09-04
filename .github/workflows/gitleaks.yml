@@ -35,3 +35,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          # ⚠️ Named explicitly rather than relying on root auto-discovery. The
+          # action shells out to the gitleaks binary from a working directory it
+          # chooses, and a config it does not find is not an error — the scan
+          # simply runs with the default rules and fails on the test fixtures
+          # again, which reads as "the allowlist does not work". See
+          # .gitleaks.toml for why the allowlist names literals, not paths.
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml

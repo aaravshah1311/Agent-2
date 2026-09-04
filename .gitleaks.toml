@@ -1,0 +1,43 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# =============================================================================
+# Gitleaks configuration — .github/workflows/gitleaks.yml
+#
+# ⚠️ THE DEFAULT RULE SET IS KEPT IN FULL. `useDefault = true` is what makes this
+# a narrowing config rather than a replacement one: omit it and gitleaks scans
+# with ONLY the rules named below, which is nothing, so every real credential
+# would pass and the workflow would go green forever. A secret scanner that
+# cannot fail is worse than no secret scanner — nobody looks at it again.
+#
+# ⚠️ WHY AN ALLOWLIST AT ALL. Agent2's test suite has to name credentials to
+# prove what it proves: that a stored ZAP key survives a failed pre-write read,
+# that a Gemini key is rotated and redacted, that `mask_secret()` never leaks a
+# character. Those literals are invented fixtures, and `generic-api-key` is an
+# entropy rule — `s3cret-zap-key` scores 3.52 and is indistinguishable, to a
+# scanner, from a real one.
+#
+# ⚠️ ALLOWLIST THE EXACT LITERALS, NEVER THE PATH. The obvious fix —
+# `paths = ['''^\.github/tests/''']` — is the wrong one: a genuine key pasted
+# into a test file during debugging is exactly the accident this scan exists to
+# catch, and it is a file people edit in a hurry. Every entry below is one
+# specific invented string, so a NEW fixture is still reported and has to be
+# added here deliberately. If that ever feels like friction, that is the feature.
+# =============================================================================
+
+title = "Agent2 gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Invented credentials that exist only as test fixtures"
+
+# Anchored to the whole secret, so these match the fixture and nothing that
+# merely contains it. Verified against the findings on the initial push:
+# .github/tests/test_mcp.py:2141 and :2150, rule generic-api-key, entropy 3.52.
+regexes = [
+    '''^s3cret-zap-key$''',
+    '''^canary-zap-9c1f$''',
+]

@@ -1,0 +1,354 @@
+# Agent2 — unified tooling config.
+#
+# ruff is the only linter that runs in CI (see .github/workflows/lint.yml).
+# mypy is configured for local/CI use but is NOT yet a hard gate: the codebase
+# predates type hints, so mypy runs in non-blocking mode and its remaining
+# findings are tracked in CI output, not failures. The goal is to move these
+# tools toward full enforcement, not to ship a wall of red.
+#
+# Design notes on the rule selection:
+#   * BLE001 / S110 — the "graceful degradation" pattern
+#     (`except Exception: pass`) is a DELIBERATE failsafe across this codebase:
+#     PIL, the Burp bridge, the web server and the DB pool all degrade to "do
+#     nothing" rather than crash a turn. Both rules are therefore ENABLED and
+#     allowed per-file (never blanket-ignored), so a NEW module is still told to
+#     narrow its except clause instead of inheriting the exemption. Leaving them
+#     out of `select` — as this config originally did — made every one of those
+#     per-file entries inert: they documented an intent nothing enforced.
+#   * RUF100 — the `agent2/*.py` shims (which re-export from subpackages via
+#     `from X import *`) legitimately carry a `# noqa: F401,F403`; the F403
+#     half is only meaningful under ruff 0.8-era configs and reads as
+#     "unused". Keep the noqa, silence the pedantry.
+#   * E501 line length — 269 lines exceed 100 cols and 230 exceed 110 (the
+#     worst is a 530-char docstring URL). Rewrapping all of that is churn with
+#     no behaviour change; the interactive formatter (ruff format) is the
+#     better tool, and it is run separately.
+#   * E701/E702 (one-line compound statements) — 28 occurrences are idiomatic
+#     one-liners in this codebase (e.g. `if x: return 0` in weblog/tools).
+#     Not worth churn.
+#
+# The enabled set below is deliberately broad (F, E, W, UP, B, C4, PIE, PERF,
+# RUF, SIM, PLR, DTZ, ARG, T20) because ruff is fast enough to run the whole
+# thing, and it catches the categories that actually matter here: unused
+# imports, shadowed loop variables, magic numbers, and raise-without-from.
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [
+    ".venv",
+    "website",
+    "public",
+    "pic",
+    ".github",
+]
+
+[tool.ruff.lint]
+select = [
+    "F", "E", "W", "UP", "B", "C4", "PIE", "PERF", "RUF",
+    "SIM", "PLR", "DTZ", "ARG", "T20",
+    # BLE001 (blind except) and S110 (try/except/pass) are the two rules that
+    # touch the failsafe design directly, so they are ENFORCED with per-file
+    # allowances rather than left off. Leaving them out of `select` made the
+    # per-file-ignores below inert: they documented an intent that nothing
+    # checked, so a new module could swallow exceptions silently and still pass.
+    #
+    # Only S110 is taken from flake8-bandit, not the whole "S" family: Agent2 is
+    # a security tool that legitimately shells out (S603/S607) and the full
+    # family would bury real findings in noise.
+    "BLE", "S110",
+]
+# Deliberate allowances — see design notes above.
+ignore = [
+    "E501",      # line length; churn without value, formatter handles it
+    "E701",      # idiomatic one-line compound statements
+    "E702",      # idiomatic semicolon one-liners
+    "PLR2004",   # magic-value-comparison; PIL's confidence deltas are intentional
+    # `contextlib.suppress(Exception)` is 28x SLOWER than bare try/except/pass
+    # (measured: 0.342s vs 0.012s over 2M iterations). Agent2's suppressed
+    # blocks sit in the DB connection pool, the PIL learning path and the
+    # logging setup — all hot. This rule would trade real throughput for a
+    # cosmetic win, so it stays off codebase-wide.
+    "SIM105",
+    # try/except inside a loop IS the failsafe: per-item degradation means one
+    # bad row/plugin/key never aborts the batch.
+    "PERF203",
+    # Unused arguments are almost always interface-mandated here (retry
+    # callbacks, plugin hooks, Socket.IO handlers) — the signature is the API.
+    "ARG001", "ARG002", "ARG003", "ARG004", "ARG005",
+    # Typography: en dashes and × are used deliberately in docs and comments.
+    "RUF001", "RUF002", "RUF003",
+    # Complexity metrics. `run_agent` (45 branches) and `dispatch_tool` are
+    # inherently branchy dispatch loops; these are tracked as refactor targets
+    # (see the cli/ package split), not gated on.
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917",
+    # Style preferences with no correctness or performance impact.
+    "SIM102", "SIM103", "SIM108",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent2"]
+
+[tool.ruff.lint.per-file-ignores]
+# ── Graceful-degradation allowances (BLE001 / S110) ───────────────────────────
+# Both rules are ENFORCED (see `select`), so every entry below is a deliberate,
+# reviewed exemption for a module whose contract is "degrade, never raise".
+# Each carries the degraded behaviour it guarantees, because that is the thing a
+# future edit must not silently break.
+#
+# Adding a file here is a design decision, not a way to quiet the linter. The
+# bar: the swallow must have a defined fallback, and losing the exception must
+# not hide a fault the user needs to act on. Every site in this list was
+# reviewed once against that bar; three failed it and were fixed rather than
+# exempted (agent.py masking quota/auth as a blank reply, a duplicate except in
+# ports.py, and a swallowed workspace-switch registration in core/session).
+
+# ── Core engine: a failed subsystem degrades, it never aborts a turn ─────────
+"agent2/core/pil/*.py" = ["BLE001", "S110"]            # → personalization off
+"agent2/core/logging.py" = ["BLE001", "S110"]          # → drop the log line
+"agent2/core/memory/__init__.py" = ["BLE001", "S110"]  # → prompt without memories
+"agent2/core/rules/__init__.py" = ["BLE001", "S110"]   # → prompt without rules
+"agent2/core/sync.py" = ["BLE001", "S110"]             # → stale cache, counted at /api/sync
+"agent2/core/session/__init__.py" = ["BLE001"]         # → import-order guard only
+# A worker must survive the turn it is running: an escaped exception would cost
+# the pool a thread permanently and it would bleed down to zero. The exception is
+# NOT lost — it is counted in stats()["failed"] and logged. A failed thread start
+# degrades to DISABLED, so the caller runs the turn on its own thread instead.
+"agent2/core/scheduler.py" = ["BLE001", "S110"]        # → turn counted failed, worker lives
+# Path containment fails CLOSED here (a rejected path is treated as outside the
+# workspace), which is why the swallow is safe for a security boundary.
+"agent2/core/workspace/__init__.py" = ["BLE001", "S110"]
+"agent2/database.py" = ["BLE001", "S110"]              # → connection discarded, not pooled
+# Presentation data for both surfaces. A diff is something the USER reads, never
+# something a turn depends on, so an unreadable file, a binary blob, a decode
+# error or a permission fault degrades to "no diff shown" — losing the exception
+# cannot hide a fault the user must act on, because the write itself still
+# reports its own success or failure through the tool result.
+"agent2/core/diffs.py" = ["BLE001", "S110"]            # → no diff rendered, write unaffected
+# Syntax highlighting is strictly cosmetic: a tokenizer failure degrades to one
+# plain `("text", line)` span, i.e. the unhighlighted line, which is exactly what
+# a terminal without colour support shows anyway.
+"agent2/core/highlight.py" = ["BLE001", "S110"]        # → line rendered unhighlighted
+# The stage trail / task queue / activity feed. Progress is presentation and is
+# on NO path a result depends on, so a raising emit (a dropped socket, a browser
+# that closed mid-turn) degrades to "no progress shown" — a turn that failed
+# because its own progress bar raised is strictly worse than one with no bar.
+"agent2/core/progress.py" = ["BLE001", "S110"]         # → progress silent, turn unaffected
+# Recovery READS state to offer a resume; it is never on the path of the work
+# itself. All four swallows are on that read side (session listing, a summary, a
+# checkpoint decode, the per-turn brief lookup) and each degrades to "nothing to
+# recover" — the durable task rows are untouched, so the next launch offers the
+# same recovery again. Losing these exceptions cannot hide a fault the user must
+# act on; raising them could stop the CLI from starting, which is the one thing a
+# recovery hint must never do. NOT exempt where it matters: `adopt()`,
+# `set_status()` and `save_checkpoint()` are unguarded, so a recovery that cannot
+# be persisted fails loudly instead of pretending it was adopted.
+"agent2/core/recovery.py" = ["BLE001", "S110"]         # → no recovery offered, state intact
+# Process plumbing (Task 5). Two distinct swallows, both with a defined fallback:
+#   * a reader thread that dies (decode error, pipe torn down under it) posts its
+#     EOF mark in `finally` and ends quietly — otherwise `drain` would wait for a
+#     sentinel that never arrives, i.e. the exact hang this module removes;
+#   * `terminate_tree` treats every failure as "there is nothing left to kill",
+#     because an already-exited process, a recycled pid or a platform without
+#     `killpg` all mean the same thing to the caller. Cancellation may not fail.
+# Neither hides a fault the user must act on: the command's own exit code and
+# output still reach them, and a kill that did not take is reported by the
+# `poll()` return value rather than by an exception.
+"agent2/core/procio.py" = ["BLE001", "S110"]           # → reader retires / nothing left to kill
+# Task 20. The Context Broker composes the prompt tail out of ~10 independent
+# sources, so the ONE thing it may never do is let a bad source cost a turn: a
+# collector that raises is caught per-source, the source is simply absent from the
+# bundle, and the other nine still render. Nothing is hidden — the failure is kept
+# in `bundle.errors`, reported by `to_payload()`, and logged as a WARNING through
+# `alog.context_source_failed()`, which exists precisely so that "the prompt is
+# missing the project's own instructions" is not silent. The alternative is a
+# failed agent turn because a README was unreadable.
+"agent2/core/broker/__init__.py" = ["BLE001", "S110"]  # → that source absent, turn proceeds
+# Task 21. Every measure in the source table is an ORDERING HINT, so the failure
+# budget for computing one is: fall back to the table default. `measure()` fills
+# four fields on an item that is already collected — a raise there would discard
+# context the collector successfully gathered, to protect a number whose only job
+# is to break a tie. Each helper carries its own documented fallback
+# (`priority_of` → DEFAULT_PRIORITY, `token_cost` → the same len//4 arithmetic,
+# `relevance_of` → UNKNOWN_RELEVANCE, `freshness_of` → 1.0), and none of them can
+# hide a real problem: the item still reaches the prompt either way.
+"agent2/core/broker/sources.py" = ["BLE001", "S110"]   # → default measure, never a raise
+# Task 22. The budget is an ACCOUNTING pass over context that was already gathered,
+# so its failure budget is: keep everything, exactly as the broker behaved before
+# the module existed. Every swallow here fails OPEN on purpose and that direction is
+# the whole point — failing closed would mean a bug in a token estimate could strip
+# the user's standing rules from the prompt, which is the one outcome this file is
+# written to prevent. Nothing is hidden either: the plan travels on the bundle, is
+# reported by `to_payload()`, and a real trim is logged through
+# `alog.context_trimmed()`.
+"agent2/core/broker/budget.py" = ["BLE001", "S110"]    # → keep everything, never a raise
+# Task 23. This module answers "may this project see that row", and it is asked on
+# every memory read, every rule read and every workspace switch — so its failure
+# budget is the one direction that cannot lose data: it degrades to the pre-Task-23
+# behaviour (unscoped, everything visible) rather than to an empty result. A raise
+# in `current()` would strip the user's own memories and standing rules from the
+# prompt, and a raise in `invalidate()` would abort a workspace switch to protect a
+# cache. Nothing is hidden: `describe()` reports the live policy through
+# `/api/health`, and the swallowed cases are all "we cannot tell where we are",
+# which the fallbacks answer honestly by showing more rather than less.
+"agent2/core/broker/isolation.py" = ["BLE001", "S110"]  # → unscoped, never a raise
+# ⚠️ EVERY FUNCTION IN gitstate IS TOTAL, and the swallow is the implementation of
+# that: `git` may be missing from PATH, the directory may not be a repository, the
+# repo may live on a dead network mount, and `git status` on a pathological tree
+# genuinely times out. All four mean the same thing to every caller — "no git
+# information" — and all four are states the app renders (the status bar shows no
+# branch, the broker emits no Git block). Losing the exception hides nothing the
+# user must act on: they can run `git status` themselves and see the real error.
+"agent2/core/gitstate.py" = ["BLE001", "S110"]         # → empty snapshot, never a raise
+
+# ── Agent loops: one bad part/tool/emit must not kill the conversation ───────
+# NOT exempt from the real rule: a key-level error (quota/auth) is re-raised to
+# the caller so rotation runs. Only per-item degradation is allowed.
+"agent2/agent.py" = ["BLE001", "S110"]
+"agent2/llm/provider_agent.py" = ["BLE001", "S110"]
+"agent2/tools.py" = ["BLE001", "S110"]
+"agent2/terminal.py" = ["BLE001", "S110"]
+
+# ── Model access: a dead key/provider is marked and rotated past ─────────────
+"agent2/llm/keys.py" = ["BLE001", "S110"]              # → usage deltas restored, key failed
+"agent2/llm/providers.py" = ["BLE001", "S110"]         # → provider reported unreachable
+# The `# noqa: BLE001` here documents a deliberate catch-all.
+"agent2/llm/resilience.py" = ["BLE001", "S110", "RUF100"]
+
+# ── File Intelligence: every third-party backend is optional/lazy ───────────
+# A missing lib must read as "capability unavailable", never as an import crash.
+"agent2/fileintel/*.py" = ["BLE001", "S110", "B904"]
+"agent2/fileintel/plugins/*.py" = ["BLE001", "S110", "B904"]
+# Banner/console output is this module's actual job.
+"agent2/fileintel/plugins/__init__.py" = ["BLE001", "S110", "B904", "T201"]
+
+# ── External bridges + web surface: the browser half never kills a turn ──────
+"agent2/integrations/burp_mcp.py" = ["BLE001", "S110"] # → Burp shown disconnected
+# The shared MCP bridge (Task 8) and the servers on it. `mcp` is a SOFT dependency
+# imported at module scope by `agent2/agent.py` with no guard, so an integration
+# module that raises takes down the entire web surface — every swallow here exists
+# to turn that into a return value. Three distinct swallows, each with a defined
+# fallback: an absent SDK degrades to `_MCP_AVAILABLE = False` (the bridge reports
+# "not connected" and the agent keeps its other tools); a candidate endpoint that
+# refuses the handshake degrades to trying the next (transport, url) pair, with
+# only the LAST failure surfaced; and a loop that will not close degrades to a
+# leaked-but-daemon thread rather than a hung `disconnect()`. None hides a fault
+# the user must act on: the failure is kept in `_last_error` and shown by `/mcp`,
+# `/mcp status` and the health section.
+"agent2/integrations/mcp_base.py" = ["BLE001", "S110"] # → bridge reports not-connected
+"agent2/integrations/zap_mcp.py" = ["BLE001", "S110"]  # → env default, key stays in memory
+# ⚠️ EVERY FUNCTION IN THE REGISTRY IS TOTAL, and that is the whole point of it:
+# it is read from both agent loops, three CLI surfaces and the health payload, so
+# a raising lookup would cost a turn to report a bridge that was merely absent. A
+# server whose module will not import is simply not in the table, which reads
+# downstream as "this build has no ZAP" — the same thing an uninstalled add-on
+# means. Losing these exceptions hides nothing: `statuses()` reports every bridge
+# that DID load, including its last error.
+"agent2/integrations/registry.py" = ["BLE001", "S110"] # → server absent from the table
+# Per-project MCP auto-connect (Task 9). `McpBridge.enabled` is a read-through
+# property consulted on the agent's tool-dispatch path and by `status()`, which
+# `/api/health` calls — so a DB fault here must produce an ANSWER, not an
+# exception. Every swallow degrades to the documented default: an unreachable or
+# pre-migration database reads as the env default (`ENV_DEFAULT`), a failed write
+# still takes effect for this process and is reported by the surface that asked,
+# and a workspace/sync hook that cannot be installed costs cache freshness rather
+# than correctness (the next write invalidates anyway). Nothing is hidden that
+# the user must act on: the toggle they see is the toggle that is in force.
+"agent2/integrations/state.py" = ["BLE001", "S110"]    # → env default, toggle still applies
+"agent2/server/sockets.py" = ["BLE001", "S110"]        # → a dead socket is dropped
+"agent2/server/routes.py" = ["BLE001"]                 # → error JSON, not a 500 page
+"agent2/server/ports.py" = ["BLE001", "S110"]          # → port treated as unusable
+# ⚠️ THIS ONE IS EXEMPT FOR THE OPPOSITE REASON TO EVERY OTHER ENTRY ABOVE.
+# Elsewhere in this table a swallowed exception degrades to "do nothing" and the
+# feature quietly does less. `auth.py` is the web surface's access decision, so
+# "do nothing" would mean "let it in" — and it never does. Every swallow here
+# fails CLOSED, which is why losing the exception hides nothing the user must act
+# on: they are refused, visibly, and the refusal is audited.
+#   lookup_session   → None      = no session = deny
+#   socket_allowed   → False     = handshake refused (its own comment says why)
+#   decide's helpers → the strict reading (untrusted origin, non-secure cookie)
+#   purge/touch/count→ housekeeping only; the deadline shortens, never extends
+# ⚠️ `revoke_session` / `revoke_all` are deliberately NOT swallowed — a revoke is
+# the one write on this path whose failure would hand access BACK, so it raises
+# and `/api/auth/logout` and `/api/auth/rotate` report 503 rather than lie. Do not
+# "tidy" them into the pattern above; test_webauth.py pins both directions.
+"agent2/server/auth.py" = ["BLE001", "S110"]           # → denied, never admitted
+# Task 15. The ONE swallow in this file is `audit_use`, and it is the harmless
+# direction: the caller has ALREADY decided by the time it calls, so losing the
+# exception costs a log line and can never change a verdict. The decision
+# functions (`allowed`, `caps_for`, `capability_for*`) deliberately contain no
+# try/except at all — a capability lookup that could swallow its way to a default
+# is a capability lookup that grants on a bug.
+"agent2/core/permissions.py" = ["BLE001", "S110"]      # → a lost log line, nothing more
+# Task 16. Every swallow here degrades toward "the credential is not encrypted"
+# or "the credential is not usable", NEVER toward "the credential is gone" — see
+# the module docstring, which states that ordering as the module's first rule.
+# `resolve()` returning "" on a bad blob is deliberate (a ciphertext handed to a
+# vendor SDK produces a baffling 400 instead of our own "no keys configured"), and
+# `seal()` reads back what it wrote so a swallowed backend fault surfaces as the
+# plaintext coming straight back rather than as a dangling reference.
+"agent2/core/secrets.py" = ["BLE001", "S110"]          # → never a lost credential
+# Phase 6. Both degrade to "we do not know" / "use what the caller asked for",
+# which are the states these modules exist to represent — so a swallowed exception
+# here loses information the app already handles rather than hiding a fault the user
+# must act on. `capabilities.get()` answering unknown is a first-class answer, and
+# `router.choose()` handing back the requested model is the no-routing default.
+# ⚠️ The two functions that DO raise are `capabilities.set_meta` (a validation error
+# the user must see, or a coerced value looks like a write that silently did
+# nothing) and `router.set_routing_mode`. Do not "tidy" those into the pattern.
+"agent2/llm/capabilities.py" = ["BLE001", "S110"]      # → unknown, never a wrong claim
+"agent2/llm/router.py" = ["BLE001", "S110"]            # → the caller's own model
+# DTZ006 here is a deliberate, documented choice (console wall-clock timestamps).
+"agent2/server/weblog.py" = ["BLE001", "S110", "T201", "DTZ006"]
+"agent2/config.py" = ["BLE001", "S110"]                # → fall back to a default path
+
+# ── CLI surface: same failsafe posture as the engine it drives ────────────────
+# Printing IS this package's job (T201), and a missing optional dependency must
+# read as "feature unavailable" rather than an import crash (BLE001/S110) —
+# `python agent2cli.py --help` has to work on a half-installed machine.
+"agent2/cli/*.py" = ["BLE001", "S110", "T201"]
+# env.py is the ONE place optional dependencies are probed; every module that
+# needs `rich` or `prompt_toolkit` imports it from there rather than re-probing.
+# Those re-exports are the interface, so they only LOOK unused (F401).
+"agent2/cli/env.py" = ["BLE001", "S110", "T201", "F401"]
+# DTZ005: the `HH:MM` stamp beside an agent reply is a WALL-CLOCK reading for the
+# person at the terminal. A tz-aware UTC timestamp would print the wrong local
+# time — same deliberate choice as weblog's DTZ006 above.
+"agent2/cli/render.py" = ["BLE001", "S110", "T201", "DTZ005"]
+
+# ── Non-failsafe allowances ──────────────────────────────────────────────────
+# Back-compat shims: `from X import *` re-exports carry a legit noqa.
+"agent2/burp_mcp.py" = ["RUF100"]
+"agent2/keys.py" = ["RUF100"]
+"agent2/ports.py" = ["RUF100"]
+"agent2/provider_agent.py" = ["RUF100"]
+"agent2/providers.py" = ["RUF100"]
+"agent2/resilience.py" = ["RUF100"]
+"agent2/routes.py" = ["RUF100"]
+"agent2/sockets.py" = ["RUF100"]
+"agent2/ui.py" = ["RUF100"]
+"agent2/weblog.py" = ["RUF100"]
+# CLI entry points are thin launchers; prints are their job.
+"agent2cli.py" = ["T201"]
+"agent2dual.py" = ["T201"]
+"agent2web.py" = ["T201"]
+"run.py" = ["T201"]
+"install.py" = ["T201"]
+"agent2_docker.py" = ["T201"]
+
+[tool.mypy]
+python_version = 3.11
+# Agent2 predates type hints. Run mypy in non-blocking mode: check the
+# modules that ARE annotated, ignore missing third-party stubs, and report
+# the rest without failing the build.
+check_untyped_defs = false
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = false
+warn_return_any = false
+follow_imports = "skip"
+# CI runs `mypy agent2` as a non-gating report; local runs can scope down
+# with `mypy agent2/core/sync.py` etc.
+exclude = [
+    "agent2/fileintel",
+]

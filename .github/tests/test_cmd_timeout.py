@@ -94,6 +94,40 @@ def quick_stuck(monkeypatch):
     return cfg
 
 
+@pytest.fixture()
+def readable_console(monkeypatch):
+    """⚠️ ARRANGE THE ONE PRECONDITION THE KEYPRESS TESTS DEPEND ON: that a key
+    can arrive at all.
+
+    `_StuckPrompt.__init__` computes `self._keys = IS_WIN or sys.stdin.isatty()`,
+    and that is a rule worth keeping — an offer nothing can accept is worse than
+    no offer (`test_the_prompt_hides_the_keys_where_nothing_can_read_them` pins
+    the other direction). But under pytest stdin is a pipe, so on POSIX `_keys` is
+    False, no handler is installed, and `_press_when_armed` waits out its whole
+    timeout while the 60 s `QUIET` command runs to completion. The tests then
+    report `assert 0 == 130` — the command exited normally, because nobody ever
+    pressed anything.
+
+    On Windows `IS_WIN` short-circuits the same expression to True, which is why
+    these three passed on a developer's machine and failed only on ubuntu-latest:
+    a real POSIX-only bug in the test's *arrangement*, not in the runner.
+
+    Patching `_StuckPrompt.__init__` — rather than `sys.stdin` — keeps this honest
+    about what is being simulated: a user sitting at a console. Nothing about the
+    behaviour under test is stubbed; the keys still travel the real
+    `state.dispatch_key` path.
+    """
+    from agent2.cli import runtime as rt
+
+    real_init = rt._StuckPrompt.__init__
+
+    def _init(self) -> None:
+        real_init(self)
+        self._keys = True
+
+    monkeypatch.setattr(rt._StuckPrompt, "__init__", _init)
+
+
 def _pid_alive(pid: int) -> bool:
     if sys.platform.startswith("win"):
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
@@ -458,7 +492,7 @@ def test_a_stuck_command_still_ticks_and_is_visible_to_the_other_surface():
         assert done.wait(40), "the timed-out command never returned"
 
 
-def test_pressing_k_kills_the_command_and_returns_control(quick_stuck):
+def test_pressing_k_kills_the_command_and_returns_control(quick_stuck, readable_console):
     """[K] — the answer that ends it. rc 130 (the SIGINT convention), status
     KILLED, and the reason says a person did it rather than a ceiling."""
     from agent2.cli import runtime as rt
@@ -474,7 +508,8 @@ def test_pressing_k_kills_the_command_and_returns_control(quick_stuck):
     assert "command stopped" in out or "killed by user" in out
 
 
-def test_pressing_r_reruns_the_command_exactly_once_more(quick_stuck, monkeypatch):
+def test_pressing_r_reruns_the_command_exactly_once_more(quick_stuck, readable_console,
+                                                         monkeypatch):
     """[R] — capped, and never automatic. Two executions on the record: the
     stopped one and the retry. ⚠️ Rule 21 lives here — Agent2 re-runs a command
     whose effects it cannot see ONLY because a person asked."""
@@ -493,7 +528,7 @@ def test_pressing_r_reruns_the_command_exactly_once_more(quick_stuck, monkeypatc
     assert rc == 130
 
 
-def test_pressing_w_extends_and_the_command_is_allowed_to_finish(quick_stuck):
+def test_pressing_w_extends_and_the_command_is_allowed_to_finish(quick_stuck, readable_console):
     """⚠️ [W] — the answer that must actually mean something.
 
     The command is quiet past the reporting threshold AND past a real idle

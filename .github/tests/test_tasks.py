@@ -1496,16 +1496,37 @@ def test_a_session_stores_the_canonical_project_key():
 
 
 def test_recovery_finds_a_session_stored_under_any_spelling():
-    """The lookup normalises too, so neither side has to remember to."""
+    """The lookup normalises too, so neither side has to remember to.
+
+    ⚠️ WHICH SPELLINGS COUNT IS THE PLATFORM'S CALL, NOT THIS TEST'S. The rule
+    under test is "the read normalises exactly as the write did" — it is NOT
+    "case never matters", because `os.path.normcase` folds case on Windows and is
+    a no-op on POSIX. On Linux `/Home/Runner` and `/home/runner` are two genuinely
+    different directories, so a recovery that matched across them would be the bug:
+    it would offer one project's unfinished work inside another. Asserting the
+    Windows answer everywhere is what broke CI on ubuntu-latest while passing on
+    every developer's machine.
+    """
     import os
 
     raw = os.path.abspath(os.getcwd())
     sid = T.open_session(chat_id="pk-chat-2", cwd=raw)
     T.start(T.create(sid, "unfinished work").id)
 
-    for spelling in (raw, raw.upper(), raw.lower(), raw + os.sep):
+    # A trailing separator is pure spelling on every OS — `abspath` strips it.
+    spellings = [raw, raw + os.sep]
+    if os.path.normcase("A") == os.path.normcase("a"):
+        spellings += [raw.upper(), raw.lower()]
+
+    for spelling in spellings:
         found = [r["id"] for r in T.unfinished_sessions(spelling)]
         assert sid in found, f"recovery lost the session for {spelling!r}"
+
+    if os.path.normcase("A") != os.path.normcase("a"):
+        # The other half of the same rule on a case-sensitive filesystem: a
+        # different directory must NOT match, or isolation is gone.
+        other = [r["id"] for r in T.unfinished_sessions(raw.upper())]
+        assert sid not in other, "a case-sensitive OS matched a different directory"
 
 
 def test_a_chat_and_its_task_session_agree_on_the_project():

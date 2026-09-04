@@ -53,12 +53,17 @@ Thumbs.db
 # are hand-maintained static HTML; there is no generator and no build step.
 # See website/docs/README.md for what must stay in sync across the 39 pages.
 .claude/
-*.toml
 
-# Local-only tooling and agent guidance. `*.toml` above already matches
-# pyproject.toml; it is named again so removing the blanket glob does not quietly
-# start tracking it. ⚠️ Both files stay on disk and are read from there —
-# .github/tests/test_lint_config.py fails if pyproject.toml is absent, so a clone
-# that does not carry it has no ruff config for that gate.
-pyproject.toml
+# ⚠️ pyproject.toml IS TRACKED, AND A BLANKET `*.toml` MUST NEVER COME BACK.
+# It is the ruff config the Lint workflow runs against, and
+# .github/tests/test_lint_config.py fails outright when it is absent. Ignoring it
+# does not make CI lenient — it makes CI run ruff with NO config, so the whole
+# documented rule set (the per-file BLE001/S110 allowances especially) evaporates
+# and the gate reports ~900 findings that pass cleanly on every developer's
+# machine. That is exactly how this repo's first push failed. If a future
+# local-only .toml needs ignoring, name that file, never the glob.
+
+# Local-only agent guidance. Read from disk, deliberately not shipped: it is
+# working notes about invariants, not documentation a clone needs, and nothing in
+# the test suite or the workflows requires it to exist.
 CLAUDE.md
