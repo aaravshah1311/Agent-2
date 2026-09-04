@@ -1,0 +1,51 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+name: Spam Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to check, if checking an issue"
+        required: false
+        type: number
+      pr_number:
+        description: "Pull request number to check, if checking a PR"
+        required: false
+        type: number
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+    
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  spam-check:
+    name: Spam Detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Run spam check module
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO_NAME: ${{ github.repository }}
+        run: PYTHONPATH=.github python -m ap_bot.main spam_check

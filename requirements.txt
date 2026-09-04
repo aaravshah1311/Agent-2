@@ -1,0 +1,51 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+#
+# Runtime dependencies for Agent2. These mirror the package lists that run.py
+# installs into the local .venv (COMMON_PACKAGES + WEB_PACKAGES + CLI_PACKAGES),
+# and are what the Docker image installs at build time.
+
+# ── Core (always required) ──────────────────────────────────────────────
+google-genai
+mcp
+
+# ── Web UI ──────────────────────────────────────────────────────────────
+flask
+flask-socketio
+
+# ── CLI terminal UI (optional at runtime, bundled for the --cli mode) ─────
+rich
+prompt_toolkit
+
+# ── File Intelligence System (agent2/fileintel/) ──────────────────────────
+# Pure-Python / wheel-only libraries powering universal file processing.
+# All imports are lazy: a missing library only surfaces when the specific
+# operation that needs it runs, so the app works with any subset installed.
+# System-binary backends (tesseract for OCR, ffmpeg for audio/video,
+# LibreOffice for high-fidelity DOCX→PDF, unrar for RAR, poppler for
+# pdf2image) are NOT listed here — they degrade gracefully with an install
+# hint at runtime. The PYTHON side of each of those bridges IS listed, so
+# `run.py` installs it and the feature is one system package away rather
+# than two.
+pypdf              # PDF read / merge / split / image + text extraction
+python-docx        # Word .docx read / extract
+openpyxl           # Excel .xlsx read / analyze / formula audit
+python-pptx        # PowerPoint .pptx read / speaker notes
+Pillow             # image metadata / convert / compress / resize
+reportlab          # universal *→PDF rendering (text & table)
+markdown           # Markdown → HTML
+beautifulsoup4     # robust HTML → text extraction
+charset-normalizer # encoding detection for text files
+py7zr              # 7z archive list / extract
+pytesseract        # OCR bridge (needs the tesseract binary at runtime)
+xlrd               # legacy Excel .xls read
+odfpy              # OpenDocument .ods spreadsheets
+rarfile            # RAR archive list / extract (needs the unrar binary)
+pdf2image          # PDF page → image for OCR (needs the poppler binaries)
+
+# Windows only — docx2pdf drives Microsoft Word over COM. run.py installs it
+# on Windows alone; it is listed here without a marker because pip installs it
+# harmlessly anywhere, and the DOCX→PDF path falls back to LibreOffice or
+# reportlab when Word is absent.
+docx2pdf ; sys_platform == "win32"

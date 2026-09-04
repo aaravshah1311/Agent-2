@@ -1,0 +1,106 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# Bug Tracking
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+- name: feature
+  color: "a2eeef"
+  description: New feature or request
+- name: enhancement
+  color: "a2eeef"
+  description: Improvement to existing functionality
+- name: documentation
+  color: "0075ca"
+  description: Improvements or additions to documentation
+- name: security
+  color: "e4e669"
+  description: Security-related issue or improvement
+- name: question
+  color: "d876e3"
+  description: Further information is requested
+
+# Technical Areas
+- name: backend
+  color: "1d76db"
+  description: Backend-related changes
+- name: frontend
+  color: "f9d0c4"
+  description: Frontend-related changes
+- name: api
+  color: "bfd4f2"
+  description: API-related changes
+- name: database
+  color: "c2e0c6"
+  description: Database-related changes
+- name: performance
+  color: "ff9f1c"
+  description: Performance improvements
+- name: ui
+  color: "f9d0c4"
+  description: UI-related changes
+- name: ai-ml
+  color: "8957e5"
+  description: AI/ML related changes
+- name: devops
+  color: "0e8a16"
+  description: DevOps and infrastructure
+
+# PR Types
+- name: bug-fix
+  color: "d73a4a"
+  description: Bug fix PR
+- name: new-feature
+  color: "a2eeef"
+  description: New feature PR
+- name: refactor
+  color: "1d76db"
+  description: Code refactoring
+- name: testing
+  color: "bfd4f2"
+  description: Test-related changes
+- name: dependency-update
+  color: "0366d6"
+  description: Dependency updates
+- name: ui-improvement
+  color: "f9d0c4"
+  description: UI improvements
+
+# Priority
+- name: critical
+  color: "b60205"
+  description: Critical priority — immediate attention required
+- name: high-priority
+  color: "d93f0b"
+  description: High priority
+- name: medium-priority
+  color: "fbca04"
+  description: Medium priority
+- name: low-priority
+  color: "0e8a16"
+  description: Low priority
+
+# Status
+- name: needs-info
+  color: "ffffff"
+  description: More information needed
+- name: needs-triage
+  color: "ededed"
+  description: Awaiting triage by maintainers
+- name: duplicate
+  color: "cfd3d7"
+  description: This issue or PR already exists
+- name: possible-spam
+  color: "b60205"
+  description: Flagged as possible spam
+- name: stale
+  color: "ededed"
+  description: Inactive for extended period
+- name: help-wanted
+  color: "008672"
+  description: Extra attention is needed
+- name: good-first-issue
+  color: "7057ff"
+  description: Good for newcomers

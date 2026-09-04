@@ -1,0 +1,41 @@
+# Author: Aarav Shah
+# Keep the build context small and reproducible. The image builds its own
+# .venv and its own DB volume — never copy the host's in.
+
+# Virtual environments (image builds a fresh one)
+.venv/
+venv/
+env/
+
+# Nested self-clone created by install.py / run.py --update.
+# The old name is kept so a checkout that predates the Agent-2-Beta → Agent-2
+# rename does not start copying its stale nested clone into the build context.
+Agent-2/
+Agent-2-Beta/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# VCS / editor / OS cruft
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs / marketing site not needed at runtime
+website/
+pic/
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore

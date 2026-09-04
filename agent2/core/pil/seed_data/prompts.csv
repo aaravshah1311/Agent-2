@@ -1,0 +1,252 @@
+prompt
+# Realistic prompt corpus for cold-start pre-training. Each row is a natural
+# prompt fed through the SAME learning engine real usage uses (learn_prompt),
+# so it grows vocab + n-grams + phrases AND mines preferences coherently.
+# Keep prompts natural and varied; the engine handles ranking/decay from here.
+# ── Web / frontend build requests ──
+create a responsive login page with React and Tailwind
+build a modern dashboard with dark mode support
+implement a responsive navbar component in React
+create a landing page with a hero section and call to action
+build a settings page with a form and validation
+add dark mode support to the existing layout
+create a reusable button component with variants
+implement client side routing with React Router
+build a data table with sorting and pagination
+create a modal dialog component that is accessible
+implement infinite scroll on the product list
+build a responsive image gallery with lazy loading
+add a loading skeleton while data is fetching
+create a toast notification system
+implement form validation with helpful error messages
+build a multi step wizard form
+create a responsive pricing page with three tiers
+add a search bar with debounced input
+implement a dropdown menu with keyboard navigation
+build a sidebar layout with collapsible sections
+# ── Backend / API build requests ──
+implement a REST API with FastAPI and PostgreSQL
+create a CRUD endpoint for users
+build a JWT authentication flow
+add rate limiting to the API endpoints
+implement pagination for the list endpoint
+create a database migration for the new schema
+build a background job queue with Redis
+implement file upload with validation
+add request logging middleware
+create a health check endpoint
+implement role based access control
+build a webhook handler with signature verification
+add caching to the expensive query
+create an endpoint that returns paginated results
+implement soft delete for records
+build a GraphQL schema for the blog
+add input validation with Pydantic
+implement refresh token rotation
+create a rate limited login endpoint
+build a search endpoint with full text search
+# ── Data / scripting requests ──
+write a function that parses a CSV file
+write a script to clean the dataset
+create a function to deduplicate records
+implement a retry with exponential backoff
+write a parser for the log file format
+create a function that validates an email address
+write a script to batch resize images
+implement a simple LRU cache
+write a function to flatten a nested dictionary
+create a utility to format currency values
+# ── Debug / refactor / test requests ──
+fix the bug in the authentication handler
+refactor this function to be more readable
+optimize this query for performance
+add error handling to the file reader
+write unit tests for the parser
+add type hints to this module
+refactor this to use async await
+explain how this code works
+find the memory leak in this loop
+add logging to help debug the issue
+write integration tests for the API
+refactor the duplicated code into a helper
+optimize this loop to reduce time complexity
+add docstrings to the public functions
+fix the race condition in the worker
+# ── Security / pentest requests ──
+scan the target host with nmap for open ports
+enumerate directories on the web server with gobuster
+test the login form for SQL injection with sqlmap
+run a vulnerability scan against the web application
+fuzz the API endpoint with ffuf for hidden paths
+analyze the captured traffic for credentials
+check the target for common misconfigurations
+enumerate subdomains for the target domain
+test for cross site scripting in the search field
+review the code for security vulnerabilities
+# ── DevOps / infra requests ──
+write a Dockerfile for the Python service
+create a docker compose file for the stack
+add a GitHub Actions workflow for tests
+configure Nginx as a reverse proxy
+write a deployment script for the app
+set up a Postgres database with Docker
+create a Kubernetes deployment manifest
+add environment variable configuration
+write a healthcheck for the container
+configure automatic database backups
+# ── Mobile app requests ──
+build a mobile app screen with React Native
+create a bottom tab navigator with three screens
+implement pull to refresh on the feed list
+add push notifications to the mobile app
+create a login screen with biometric authentication
+build an offline first sync layer for the app
+implement a swipeable card stack component
+add a splash screen and app icon
+create a settings screen with toggle switches
+build a camera screen with image capture
+# ── AI / ML / data science requests ──
+train a classifier on the tabular dataset
+build a data pipeline that cleans and normalizes the input
+implement a recommendation engine with collaborative filtering
+create an embedding search over the documents
+fine tune a model on the custom dataset
+build a retrieval augmented generation pipeline
+write a function to compute cosine similarity
+implement a sentiment analysis endpoint
+create a dashboard to visualize model metrics
+build a feature engineering pipeline with pandas
+implement k fold cross validation for the model
+write a data loader for the image dataset
+create a confusion matrix plot for the predictions
+build a vector database index for semantic search
+implement early stopping in the training loop
+# ── Testing / quality requests ──
+write end to end tests with Playwright
+add a pytest fixture for the database
+create a mock for the external API call
+write property based tests for the parser
+add snapshot tests for the React components
+implement a load test for the checkout flow
+write a test that covers the edge cases
+add code coverage reporting to the pipeline
+create a smoke test for the deployment
+mock the network requests in the unit tests
+# ── Documentation / explain requests ──
+write a README for this project
+document the public API with examples
+explain the difference between these two approaches
+add inline comments explaining the tricky logic
+write a migration guide for the breaking change
+create an architecture diagram for the system
+summarize what this module does
+write usage examples for the library
+document the environment variables needed
+explain the tradeoffs of this design
+# ── Git / workflow requests ──
+write a commit message for these changes
+create a pull request description
+resolve the merge conflict in this file
+write a git hook to run tests before commit
+squash these commits into one
+set up a branch protection rule
+create a changelog from the recent commits
+write a rebase strategy for the feature branch
+# ── Advanced security / pentest requests ──
+perform a full port scan and service enumeration
+extract strings from the binary and look for secrets
+analyze the memory dump with volatility
+brute force the login with hydra using a wordlist
+decode the obfuscated payload and explain it
+check the JWT token for weak signing algorithms
+test the file upload for a path traversal bypass
+enumerate the SMB shares on the target
+craft a reverse shell payload for the target
+analyze the firmware image with binwalk
+test the API for broken object level authorization
+check for server side request forgery in the webhook
+review the smart contract for reentrancy bugs
+perform a password spray against the login portal
+extract credentials from the network capture
+# ── Performance / optimization requests ──
+profile the endpoint and find the bottleneck
+reduce the bundle size of the frontend
+add database indexes to speed up the query
+implement request batching to reduce round trips
+cache the expensive computation with memoization
+optimize the image assets for faster loading
+parallelize the batch processing job
+reduce memory usage in the data pipeline
+add connection pooling to the database client
+lazy load the heavy components on demand
+# ── Game / graphics requests ──
+create a 2D platformer movement controller
+implement collision detection for the sprites
+build a particle system for the explosion effect
+add a day night cycle to the scene
+create a procedural terrain generator
+implement a inventory system with drag and drop
+build a dialogue system with branching choices
+add a save and load system for the game state
+create a shader for the water surface
+implement pathfinding for the enemy AI
+# ── E-commerce / SaaS requests ──
+build a shopping cart with quantity controls
+implement a checkout flow with Stripe
+create a subscription billing system
+add a product search with filters and facets
+build an admin dashboard for managing orders
+implement a coupon and discount code system
+create an invoice generator with PDF export
+add a wishlist feature for logged in users
+build a multi tenant workspace system
+implement usage based billing metering
+# ── Automation / scripting requests ──
+write a script to rename files in bulk
+automate the deployment with a shell script
+create a cron job that cleans up old logs
+write a scraper for the product listings
+build a bot that posts updates to Slack
+automate the backup of the database nightly
+write a script to sync two directories
+create a CLI tool with argument parsing
+build a watcher that reloads on file change
+write a script to generate test data
+# ── Networking / systems requests ──
+implement a TCP server that echoes messages
+write a UDP client for the discovery protocol
+build a simple HTTP proxy server
+implement a rate limiter with a token bucket
+create a connection pool for the database
+write a load balancer that round robins requests
+implement a heartbeat mechanism for the cluster
+build a message broker with pub sub
+add TLS support to the socket server
+implement graceful shutdown for the service
+# ── Frontend state / UX requests ──
+manage global state with a context provider
+implement optimistic updates for the mutation
+add keyboard shortcuts to the editor
+create a drag and drop kanban board
+implement undo and redo for the canvas
+add a command palette with fuzzy search
+build a virtualized list for large datasets
+implement a theme switcher with system preference
+add form autosave with debounce
+create an accessible tooltip component
+# ── More security / exploitation requests ──
+write a fuzzer for the input parser
+analyze the pcap for exfiltration patterns
+bypass the WAF with an encoded payload
+enumerate cloud storage buckets for the target
+test the OAuth flow for token leakage
+check the container image for known CVEs
+perform DNS enumeration for the domain
+craft a phishing page clone for the assessment
+analyze the Android APK for hardcoded secrets
+test the GraphQL endpoint for introspection leaks
+review the IAM policy for privilege escalation
+extract the encryption key from the memory dump
+test for race conditions in the payment flow
+enumerate API endpoints from the JavaScript bundle
+check the SSL configuration for weak ciphers

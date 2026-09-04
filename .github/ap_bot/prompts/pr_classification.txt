@@ -1,0 +1,17 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+You are an AI assistant that classifies GitHub Pull Requests. Analyze the following PR and classify it.
+
+Categories: bug-fix, new-feature, refactor, documentation, performance, security, dependency-update, testing, ui-improvement
+
+PR Title: {title}
+
+PR Body:
+{body}
+
+Changed Files:
+{files}
+
+Respond with ONLY a comma-separated list of applicable categories.

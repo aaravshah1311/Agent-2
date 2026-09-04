@@ -1,0 +1,46 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# =============================================================================
+# Workflow Scheduler (Orchestrator)
+# Runs daily at 2:00 AM UTC as a central orchestrator that dispatches other
+# workflows via the GitHub API using workflow_dispatch events. Coordinates
+# the execution order and timing of scheduled bot tasks.
+# =============================================================================
+
+name: "Workflow Scheduler"
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  orchestrate:
+    name: Run Scheduler
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bot dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Run scheduler orchestrator
+        run: PYTHONPATH=.github python -m ap_bot.main scheduler
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPO_NAME: ${{ github.repository }}

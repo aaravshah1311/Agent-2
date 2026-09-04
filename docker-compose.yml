@@ -1,0 +1,40 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+#
+# One-command Agent2 on any device:  docker compose up -d
+# Then open http://localhost:1311 and add your API key in the UI (it persists
+# in the named volume below, so you only do it once per device).
+
+services:
+  agent2:
+    build: .
+    image: agent2:latest
+    container_name: agent2
+    restart: unless-stopped
+    ports:
+      - "1311:1311"
+    environment:
+      # web | cli | dual. The long-running detached service stays "web": a
+      # background container has no TTY to host a CLI. Use `agent2 cli` or
+      # `agent2 dual` (agent2_docker.py), which run a one-off interactive
+      # container with AGENT2_MODE overridden.
+      AGENT2_MODE: "web"
+      # Persist DB (keys, providers, memories, rules) on the volume below.
+      AGENT2_DB: "/data"
+      # Flask session secret — set a stable value so sessions survive restarts.
+      # Override in a .env file next to this compose file if you like.
+      SECRET_KEY: "${SECRET_KEY:-change-me-please}"
+      # Burp Suite MCP bridge. Burp runs on the HOST, not in this container, so
+      # point at the host loopback. Uncomment BURP_MCP_ENABLED to auto-connect.
+      BURP_MCP_URL: "${BURP_MCP_URL:-http://host.docker.internal:9876}"
+      # BURP_MCP_ENABLED: "1"
+    volumes:
+      - agent2-data:/data
+    extra_hosts:
+      # Lets the container reach Burp on the host via host.docker.internal
+      # (Docker Desktop provides this automatically; declared here for Linux).
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  agent2-data:

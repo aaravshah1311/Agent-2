@@ -1,0 +1,7 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+requests>=2.31.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0

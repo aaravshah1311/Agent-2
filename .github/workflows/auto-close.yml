@@ -1,0 +1,45 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# =============================================================================
+# Auto-Close Stale Issues
+# Runs daily at 1:00 AM UTC to automatically close issues that have exceeded
+# the stale grace period without activity. Uses the AP Bot's auto_close
+# module to enforce issue lifecycle policies.
+# =============================================================================
+
+name: "Auto-Close Stale Issues"
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  auto-close:
+    name: Close Stale Issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bot dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Run auto-close module
+        run: PYTHONPATH=.github python -m ap_bot.main auto_close
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPO_NAME: ${{ github.repository }}

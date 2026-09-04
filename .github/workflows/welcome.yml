@@ -1,0 +1,50 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+name: Welcome New Contributors
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to welcome, if welcoming an issue"
+        required: false
+        type: number
+      pr_number:
+        description: "Pull request number to welcome, if welcoming a PR"
+        required: false
+        type: number
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  welcome:
+    name: Welcome Message
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Run welcome module
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO_NAME: ${{ github.repository }}
+        run: PYTHONPATH=.github python -m ap_bot.main welcome

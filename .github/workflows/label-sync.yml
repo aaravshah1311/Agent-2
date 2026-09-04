@@ -1,0 +1,47 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# =============================================================================
+# Label Sync
+# Creates every label defined in ap_bot/config.py (LABELS) in the repository.
+# The AI labeler modules only apply labels that already exist, so this keeps
+# the repo's label set in sync with the bot configuration. Runs manually or
+# whenever the label configuration changes on the default branch.
+# =============================================================================
+
+name: Label Sync
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/ap_bot/config.py"
+
+permissions:
+  issues: write
+
+jobs:
+  label-sync:
+    name: Sync Repository Labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Run label sync module
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+        run: PYTHONPATH=.github python -m ap_bot.main label_sync
