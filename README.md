@@ -6,7 +6,7 @@ github: github.com/aaravshah1311
 
 <h1 align="center">⚡ Agent-2</h1>
 
-<h2>Stay Tuned, Massive, Powerfull Update Comming Soon</h2>
+<h2 align="center">Stay Tuned, Massive, Powerfull Update Comming Soon</h2>
 
 <p align="center">
   <em>A self-hosted autonomous AI agent powered by Google Gemini —<br>
