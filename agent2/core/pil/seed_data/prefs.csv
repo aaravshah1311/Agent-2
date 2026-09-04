@@ -1,0 +1,97 @@
+category,value,weight
+# Preference seeds for Module 3 (prompt improvement). IMPORTANT: weights are set
+# BELOW improve.MIN_PREF_WEIGHT (0.62) on purpose. The improve module must only
+# inject PROVEN preferences, so these start dormant and only begin influencing
+# prompts once the user actually demonstrates them in real usage. This preserves
+# the "never invents requirements" guarantee while giving the ranking a head start.
+framework,React,0.45
+framework,Next.js,0.4
+framework,Vue,0.35
+framework,Django,0.4
+framework,Flask,0.4
+framework,FastAPI,0.45
+library,Tailwind CSS,0.45
+library,Bootstrap,0.35
+language,TypeScript,0.4
+language,Python,0.45
+language,Rust,0.35
+language,Go,0.35
+style,responsive design,0.45
+style,dark mode,0.45
+style,accessibility support,0.4
+style,mobile-first design,0.35
+style,modern design,0.4
+style,minimal design,0.35
+length,concise,0.4
+length,detailed,0.35
+# ── More frameworks ──
+framework,SvelteKit,0.35
+framework,NestJS,0.35
+framework,Express,0.4
+framework,Spring,0.35
+framework,Rails,0.35
+framework,Laravel,0.35
+framework,React Native,0.4
+framework,Flutter,0.35
+# ── More libraries / styling ──
+library,shadcn/ui,0.35
+library,Material UI,0.35
+library,Chakra UI,0.35
+library,Prisma,0.4
+library,SQLAlchemy,0.4
+library,Redux,0.35
+library,Zustand,0.35
+# ── More languages ──
+language,JavaScript,0.4
+language,Java,0.35
+language,Kotlin,0.35
+language,Swift,0.35
+language,C#,0.35
+# ── More styles ──
+style,clean architecture,0.4
+style,type-safe code,0.4
+style,test-driven development,0.35
+style,well-documented code,0.4
+style,production-ready code,0.4
+style,secure by default,0.4
+# ── Testing / tooling prefs ──
+testing,pytest,0.4
+testing,Jest,0.35
+testing,Playwright,0.35
+tooling,Docker,0.4
+tooling,GitHub Actions,0.35
+# ── More frameworks / runtimes ──
+framework,Astro,0.35
+framework,Remix,0.35
+framework,Gin,0.35
+framework,Phoenix,0.35
+framework,Unity,0.35
+framework,Godot,0.35
+# ── More languages ──
+language,Go,0.4
+language,C++,0.35
+language,Solidity,0.35
+language,Elixir,0.35
+language,Dart,0.35
+# ── More libraries ──
+library,LangChain,0.35
+library,Pydantic,0.4
+library,NumPy,0.35
+library,Pandas,0.4
+library,PyTorch,0.35
+# ── Database prefs ──
+database,PostgreSQL,0.45
+database,SQLite,0.4
+database,Redis,0.4
+database,MongoDB,0.35
+# ── Cloud / deploy prefs ──
+cloud,AWS,0.4
+cloud,Docker,0.45
+cloud,Vercel,0.35
+cloud,Kubernetes,0.35
+# ── More styles ──
+style,mobile responsive,0.4
+style,dark theme,0.4
+style,minimal dependencies,0.4
+style,error handling included,0.4
+style,input validation,0.4

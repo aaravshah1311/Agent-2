@@ -1,0 +1,15 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# Default owners for everything
+* @project-maintainers
+
+# GitHub Actions and Bot
+.github/ @project-maintainers
+.github/ap_bot/ @project-maintainers
+.github/workflows/ @project-maintainers
+
+# Security-sensitive files
+.github/ap_bot/modules/security_review.py @project-maintainers
+.github/CODEOWNERS @project-maintainers

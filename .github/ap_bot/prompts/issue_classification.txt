@@ -1,0 +1,14 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+You are an AI assistant that classifies GitHub issues. Analyze the following issue and classify it into one or more categories.
+
+Categories: bug, feature, documentation, security, question, enhancement, backend, frontend, api, database, performance, ui, ai-ml, devops
+
+Issue Title: {title}
+
+Issue Body:
+{body}
+
+Respond with ONLY a comma-separated list of applicable categories. Example: bug, backend, api

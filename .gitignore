@@ -1,0 +1,64 @@
+﻿# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local databases and runtime output
+*.db
+# SQLite WAL-mode sidecars. `*.db` does NOT match these — the suffix comes after
+# the extension — so without these two lines a `git add -A` taken while the app is
+# running would commit the write-ahead log and its shared-memory index.
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+# All log files now live in one folder (see config.LOG_DIR / AGENT2_LOG_DIR).
+logs/
+.github/ap_bot/cache/
+.github/ap_bot/logs/
+
+# Scratch files, ROOT ONLY. `_msg.txt` is the CLI's external-editor scratch
+# buffer; `_sabotage_*.py` / `_probe_*.py` are the throwaway harnesses used to
+# prove a guard actually fails when the thing it guards is broken. All three
+# showed up as untracked noise in every `git status` mid-refactor.
+# ⚠️ The leading `/` is load bearing — an unanchored `_*.py` would also match
+# every `__init__.py` in the tree and silently untrack the whole package.
+/_msg.txt
+/_sabotage_*.py
+/_probe_*.py
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Note: the marketing/docs site under website/ and static assets under public/
+# ARE tracked on purpose — do not ignore them. The docs pages under website/docs/
+# are hand-maintained static HTML; there is no generator and no build step.
+# See website/docs/README.md for what must stay in sync across the 39 pages.
+.claude/
+*.toml
+
+# Local-only tooling and agent guidance. `*.toml` above already matches
+# pyproject.toml; it is named again so removing the blanket glob does not quietly
+# start tracking it. ⚠️ Both files stay on disk and are read from there —
+# .github/tests/test_lint_config.py fails if pyproject.toml is absent, so a clone
+# that does not carry it has no ruff config for that gate.
+pyproject.toml
+CLAUDE.md

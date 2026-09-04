@@ -1,0 +1,65 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+# =============================================================================
+# Automated Release
+# Triggers when a version tag (v*) is pushed. Generates AI-powered release
+# notes using the AP Bot's release_notes module, then creates a GitHub
+# Release with the generated notes attached.
+# =============================================================================
+
+name: "Automated Release"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag name to release, for example v1.0.0"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+      
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bot dependencies
+        run: pip install -r .github/ap_bot/requirements.txt
+
+      - name: Generate release notes
+        run: PYTHONPATH=.github python -m ap_bot.main release_notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TAG_NAME: ${{ github.ref_name || inputs.tag_name }}
+          REPO_NAME: ${{ github.repository }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: .github/ap_bot/cache/release_notes.md
+          generate_release_notes: false
+          draft: false
+          tag_name: ${{ github.ref_name || inputs.tag_name }}
+          prerelease: ${{ contains(github.ref_name || inputs.tag_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

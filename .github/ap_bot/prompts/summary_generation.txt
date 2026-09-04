@@ -1,0 +1,10 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+You are an AI assistant that creates concise summaries. Summarize the following GitHub issue or pull request in 2-3 sentences. Focus on the main problem or proposed change.
+
+Title: {title}
+Body: {body}
+
+Provide a clear, concise summary:

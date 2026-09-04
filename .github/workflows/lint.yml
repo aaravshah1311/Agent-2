@@ -1,0 +1,53 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+name: Lint
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Code Linting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # ruff is the single enforced gate (no more continue-on-error). The
+      # rule set and per-file allowances live in pyproject.toml — the
+      # deliberate graceful-degradation (except Exception) and shim
+      # re-export patterns are documented there, not blanket-silenced.
+      - name: Run ruff
+        run: ruff check agent2 --output-format=github
+
+      # NOTE: `ruff format` is deliberately NOT run. It would reformat 59 of 65
+      # files — exploding grouped imports to one-per-line and undoing the
+      # aligned inline comments this codebase uses throughout — for zero
+      # behaviour change. Lint for correctness, not for a house style rewrite.
+
+      # mypy is advisory: the codebase predates type hints, so it reports
+      # rather than gates. Run it so regressions in the annotated modules
+      # (core/sync.py etc.) are visible in CI output.
+      - name: Type check (advisory)
+        continue-on-error: true
+        run: |
+          pip install mypy
+          mypy agent2 --ignore-missing-imports --follow-imports=skip
