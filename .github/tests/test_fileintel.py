@@ -13,7 +13,6 @@ fake in-memory registry so the result is independent of which libs happen to be
 installed; plugin smoke tests only exercise stdlib-backed operations.
 """
 
-import struct
 import zipfile
 
 import pytest
@@ -217,6 +216,66 @@ def test_security_workspace_confinement(tmp_path):
         security.preflight(outside, workspace_root=str(root))
 
 
+# ── security: the OPTIONS dict carries paths too ──────────────────────────────────
+# `options` is model-supplied, and ~26 plugin sites read a path out of it and
+# then write to it. Confining only the subject path left that wide open.
+
+def test_confine_options_rewrites_an_inside_path_and_refuses_every_escape(tmp_path):
+    from pathlib import Path
+    root = tmp_path / "ws"
+    root.mkdir()
+
+    # A relative option resolves against the ROOT, not the process cwd — the
+    # rule workspace.validate_path already applies to every other tool path.
+    opts = security.confine_options({"output_path": "out.txt"}, str(root))
+    assert Path(opts["output_path"]) == root / "out.txt"
+
+    for bad in ({"output_path": str(tmp_path / "evil.txt")},
+                {"output_dir": ".." },
+                {"other": str(tmp_path / "evil.txt")},
+                {"compare_to": "../evil.txt"},
+                {"paths": ["ok.txt", "../evil.txt"]}):
+        with pytest.raises(UnsafePath):
+            security.confine_options(bad, str(root))
+
+
+def test_confine_options_leaves_non_path_options_and_bad_types_alone(tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    raw = {"to_format": "txt", "quality": 80, "output_path": None, "paths": "notalist"}
+    assert security.confine_options(raw, str(root)) == raw
+
+
+def test_confine_options_is_a_no_op_without_a_root():
+    # Direct library use keeps its whole-machine posture (resolve_safe's rule).
+    raw = {"output_path": "/anywhere/out.txt", "paths": ["a", "b"]}
+    assert security.confine_options(raw, None) == raw
+
+
+def test_executor_refuses_an_output_dir_that_escapes_the_workspace(tmp_path):
+    from agent2.fileintel import EXECUTOR
+    root = tmp_path / "ws"
+    root.mkdir()
+    archive = root / "a.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("inner.txt", "payload")
+
+    escape = tmp_path / "outside_dir"
+    res = EXECUTOR.run_operation(str(archive), "extract",
+                                 {"output_dir": str(escape)},
+                                 workspace_root=str(root))
+    assert "error" in res
+    assert not escape.exists(), "extraction wrote outside the workspace"
+
+    # The same operation still works inside it — the guard confines, it does not
+    # remove the ability to choose an output directory.
+    ok = EXECUTOR.run_operation(str(archive), "extract",
+                                {"output_dir": str(root / "out")},
+                                workspace_root=str(root))
+    assert "error" not in ok, ok
+    assert (root / "out" / "inner.txt").read_text() == "payload"
+
+
 # ── executor (end-to-end, stdlib path) ───────────────────────────────────────────
 
 def test_executor_returns_structured_error_never_raises():
@@ -372,3 +431,62 @@ def test_dispatch_detect_file(tmp_path, sandbox_at):
     res = dispatch_tool("detect_file", {"path": p})
     assert res["format"] == "csv"
     assert "analyze" in res["operations"]
+
+
+def test_dispatch_run_file_op_refuses_an_output_dir_outside_the_workspace(tmp_path, sandbox_at):
+    """A path-bearing OPTION is confined exactly as `path` is.
+
+    `run_file_op` used to sanitise only its subject path and forward `options`
+    verbatim, so a model could name any directory on disk as `output_dir` and the
+    archive plugin would happily write there — a refusal its sibling
+    `convert_file` had been giving for the identical key all along.
+    """
+    from agent2.tools import dispatch_tool
+    archive = tmp_path / "z.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("inner.txt", "payload")
+
+    escape = tmp_path.parent / "a2-escape-run-file-op"
+    res = dispatch_tool("run_file_op", {
+        "path": str(archive), "operation": "extract",
+        "options": {"output_dir": str(escape)}})
+    assert res.get("code") == "outside_workspace", res
+    assert not (escape / "inner.txt").exists()
+
+
+def test_dispatch_run_file_op_hands_the_workspace_root_to_the_library(tmp_path, sandbox_at, monkeypatch):
+    """The tool layer must SEND the root, or the library gate is inert.
+
+    `security.confine_options()` and `resolve_safe()` are both no-ops without a
+    workspace root, so the executor's backstop only exists if this argument is
+    passed — the omission is invisible from the outside.
+    """
+    import agent2.fileintel as fi
+    from agent2.tools import dispatch_tool
+    seen = {}
+
+    def fake_run_op(path, operation, options=None, workspace_root=None, **kw):
+        seen["root"] = workspace_root
+        return {"ok": True}
+
+    def fake_convert(path, to_format, output_path=None, workspace_root=None, **kw):
+        seen["convert_root"] = workspace_root
+        return {"ok": True}
+
+    monkeypatch.setattr(fi, "run_op", fake_run_op)
+    monkeypatch.setattr(fi, "convert_file", fake_convert)
+    p = _write(tmp_path / "t.txt", "x")
+    dispatch_tool("run_file_op", {"path": p, "operation": "read"})
+    dispatch_tool("convert_file", {"path": p, "to_format": "md"})
+    assert seen["root"] == str(sandbox_at)
+    assert seen["convert_root"] == str(sandbox_at)
+
+
+def test_dispatch_run_file_op_survives_a_non_dict_options(tmp_path, sandbox_at):
+    """The model sends `options` as a JSON string often enough to matter."""
+    from agent2.tools import dispatch_tool
+    p = _write(tmp_path / "o.txt", "hello opts")
+    for opts in ('{"encoding": "utf-8"}', "not json at all", 7, None):
+        res = dispatch_tool("run_file_op",
+                            {"path": p, "operation": "read", "options": opts})
+        assert "hello opts" in res.get("text", ""), (opts, res)

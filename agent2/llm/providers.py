@@ -104,6 +104,26 @@ def list_providers(safe: bool = True) -> list[dict]:
     return rows
 
 
+def count_providers() -> int:
+    """How many custom providers are registered — and **0 if the table is absent**.
+
+    ⚠️ THIS IS NOT `len(list_providers())`, AND THE DIFFERENCE IS THE WHOLE POINT.
+    `providers` is created by `init_providers_table()`, not by `init_db()` (see
+    migration 5's note in `database.py`), so every reader that runs before an entry
+    point has called it — `/api/health`, a metrics read, an embedder that only
+    registered the routes — hits `no such table: providers`. For a *count* that is
+    not an error: no table means no rows, and "0 providers" is the true answer.
+
+    The list form is deliberately left to raise, because a caller asking for rows
+    to render or to send a credential with wants to know the store is missing.
+    """
+    try:
+        row = qone("SELECT COUNT(*) AS n FROM providers")
+    except Exception:
+        return 0
+    return int((row or {}).get("n") or 0)
+
+
 def get_provider(pid: str) -> dict | None:
     """One provider row with a USABLE `api_key`.
 
@@ -271,7 +291,24 @@ def _http_post(url: str, headers: dict, payload: dict, timeout: float | None = N
 # defined here once and rendered into each provider's wire format.
 
 def agent_tool_schema() -> list[dict]:
-    """Canonical tool list as plain JSON-Schema dicts (provider-agnostic)."""
+    """Canonical tool list as plain JSON-Schema dicts (provider-agnostic).
+
+    ⚠️ **A TOOL EXISTS ONLY IF FOUR LISTS AGREE, AND THIS IS THE ONE WHERE AN
+    OMISSION IS INVISIBLE FROM BOTH ENDS.** The other three are checkable by using
+    Agent2: a name missing from `agent._LOCAL_TOOLS` answers "not registered"
+    mid-turn, and one missing from a `_build_tools()` is at least absent from the
+    surface you are looking at. A name missing *here* means every custom provider
+    can happily **dispatch** it — `provider_agent.py` routes through
+    `_LOCAL_TOOLS`, not through this list — and no custom provider is ever
+    **told** it exists. So the tool works perfectly whenever a model guesses the
+    name, and is never offered. `emit_plan` shipped in exactly that state.
+
+    ⚠️ Names here must equal `tools._build_tools()` and
+    `cli/tooling._build_tools()` exactly, pinned by
+    `test_cli.py::test_advertised_and_dispatchable_tools_agree_both_ways`. The
+    descriptions need not match and deliberately do not — presentation is each
+    surface's own prose.
+    """
     obj = "object"
     return [
         {"name": "run_command",
@@ -324,10 +361,26 @@ def agent_tool_schema() -> list[dict]:
              "todos": {"type": "array", "items": {"type": obj, "properties": {
                  "task": {"type": "string"}, "status": {"type": "string"}}}}},
              "required": ["todos"]}},
+        {"name": "emit_plan",
+         "description": "Show a step-by-step plan before a complex multi-step task.",
+         "parameters": {"type": obj, "properties": {
+             "title": {"type": "string"}, "steps": {"type": "string"}},
+             "required": ["title", "steps"]}},
         {"name": "save_memory",
          "description": "Persist an important fact across sessions.",
          "parameters": {"type": obj, "properties": {"content": {"type": "string"}},
                         "required": ["content"]}},
+        {"name": "update_project_doc",
+         "description": "Re-scan this project and refresh its .agent2/agent2.md brief "
+                        "(purpose, features, architecture, commands, layout). Call AFTER you "
+                        "finish work that CHANGED what the project contains — a new feature, "
+                        "module, entry point, dependency, command or a restructure — so the "
+                        "doc stays true. It preserves anything a human wrote. Set describe=true "
+                        "ONLY when you changed what the project is FOR (new purpose or headline "
+                        "feature). Do NOT call it after read-only work, a one-line fix, or a "
+                        "question. No arguments are required.",
+         "parameters": {"type": obj, "properties": {
+             "describe": {"type": "boolean"}, "hint": {"type": "string"}}}},
         # ── File Intelligence System ────────────────────────────────────────
         {"name": "detect_file",
          "description": "Auto-detect a file's type, metadata (size, dates, checksum, "

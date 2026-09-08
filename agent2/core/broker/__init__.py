@@ -96,6 +96,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent2.core import metrics as _metrics
 from agent2.core import sync as _sync
 from agent2.core.broker import budget as _budget
 from agent2.core.broker import isolation as _isolation
@@ -125,6 +126,10 @@ ALWAYS: frozenset[str] = _sources.ALWAYS
 # How much of `.agent2/agent2.md` reaches the prompt. Bounded because it is a file
 # a user (or `/init`) writes and nothing stops it growing: unbounded, one project
 # file would crowd out every other source on every turn.
+# ⚠️ THIS IS THE BUDGET, NOT THE CLIP. *What* survives it is
+# `projectdoc.for_prompt()`'s decision, because it turns on which sections a human
+# owns — a fact of that module and of nowhere else. Slicing here instead cut the
+# document head-first, and a doc ends with the sections a human took over.
 PROJECT_DOC_CHARS = 6_000
 
 # Bounds on the situational lists. Each exists so a long-running session cannot
@@ -500,12 +505,30 @@ def _collect_project(req: ContextRequest) -> list[ContextItem]:
         lines.append("- Documentation present: " + ", ".join(found))
 
     text = "\n\n## PROJECT CONTEXT\n" + "\n".join(lines)
+    clip: dict = {}
     if primary.strip():
-        body = primary.strip()
-        clipped = len(body) > PROJECT_DOC_CHARS
-        if clipped:
-            body = body[:PROJECT_DOC_CHARS].rstrip() + \
-                "\n…(project instructions truncated — read " + PRIMARY_DOC + " for the rest)"
+        # ⚠️ THE CLIP IS OWNERSHIP-AWARE, AND THAT DECISION IS NOT THIS MODULE'S.
+        # `PROJECT_DOC_CHARS` is how much of the doc a prompt may spend — a budget,
+        # which is a broker fact. *Which part survives* depends on which sections a
+        # human took over, which only `projectdoc` knows, so it decides and this asks.
+        # The `body[:PROJECT_DOC_CHARS]` slice that used to live here was head-first,
+        # and a doc ends with the sections a human owns: `## Agent2 Instructions` was
+        # the first thing dropped, so the standing orders the marker design exists to
+        # protect never reached the model — silently, and only once the doc grew.
+        from agent2.core import projectdoc as _pdoc
+        body, clip = _pdoc.for_prompt(primary, PROJECT_DOC_CHARS)
+        if clip.get("clipped"):
+            gone = clip.get("dropped") or []
+            if gone:
+                # ⚠️ NAMED, NEVER COUNTED. "3 sections omitted" tells the model that
+                # something is missing; naming them tells it what to go and read, and
+                # `read_file` is a tool it already has.
+                body += ("\n\n_(truncated for this prompt — generated section(s) not "
+                         "shown: " + ", ".join(gone) + ". Read `" + PRIMARY_DOC +
+                         "` for them.)_")
+            else:
+                body += ("\n…(project instructions truncated — read " + PRIMARY_DOC +
+                         " for the rest)")
         text += (f"\n\n## PROJECT INSTRUCTIONS ({PRIMARY_DOC})\n"
                  "These are this project's own instructions. Follow them over your "
                  "general defaults.\n\n" + body)
@@ -516,7 +539,13 @@ def _collect_project(req: ContextRequest) -> list[ContextItem]:
         label="Project",
         meta={"root": str(root), "name": name, "docs": found,
               "primary": PRIMARY_DOC if primary else "",
-              "primary_chars": len(primary)},
+              "primary_chars": len(primary),
+              # What the prompt did NOT get. ⚠️ Reported rather than merely done:
+              # a doc section missing from a prompt with nothing said about it is
+              # indistinguishable from a doc that never had the section.
+              "primary_clipped": bool(clip.get("clipped")),
+              "primary_dropped": list(clip.get("dropped") or []),
+              "primary_over": bool(clip.get("over"))},
     )]
 
 
@@ -703,19 +732,101 @@ def _collect_files(req: ContextRequest) -> list[ContextItem]:
 
 @collector(SOURCE_SKILLS)
 def _collect_skills(req: ContextRequest) -> list[ContextItem]:
-    """Nothing yet — Phase 11 replaces this via `register(SOURCE_SKILLS, …)`.
+    """This turn's selected skills, from `core.skills` (Phase 11, Tasks 32–36).
 
-    Declared now so the source has a name, an order and a slot in the report
-    before it has an implementation. The alternative is that Phase 11 edits this
-    module's composition, which is the thing the registry exists to avoid.
+    ⚠️ **THE SELECTION IS NOT MADE HERE.** `skills.for_turn()` owns it — discovery,
+    the user's per-project choices, the deterministic order and the two caps — and
+    this collector renders what it returns. That is why the slot was declared empty
+    in Task 20: a broker that decided *which* skills apply would be a second
+    ordering beside `select.REASONS`, and the prompt would then contain one
+    selection while `/skills` and `GET /api/skills` described another.
+
+    ⚠️ **`relevance` IS PRE-STATED, DELIBERATELY.** `sources.measure()` fills only
+    what a collector left unset, and its generic pass scores an item by word overlap
+    with the whole rendered text — which for skills is backwards: the longest file in
+    the folder would out-score the one the user named. Selection already computed a
+    relevance from what each skill *declares*, so it is carried here and the generic
+    pass leaves it alone (see `ContextItem`'s "not stated is not zero").
+
+    A skill that reached the prompt is reported in `meta` by id and reason only —
+    never its text. `ContextBundle.to_payload()` is served to a browser.
     """
-    return []
+    from agent2.core import skills as _skills
+
+    sel = _skills.for_turn(req.message)
+    text = _skills.prompt_block(sel)
+    if not text:
+        return []
+    # Selection's integer score against its own strongest possible signal, mapped
+    # into the 0–1 measure the rest of Task 21 speaks. `request` is 1.0 by
+    # definition: the user named it, and no lexical score outranks that.
+    top = max((a.score for a in sel.applied), default=0) or 1
+    best = max((_skills.REASONS.index(a.reason) for a in sel.applied), default=0)
+    rel = 1.0 if best == 0 else min(1.0, max(0.2, top / (top + 3.0)))
+    return [ContextItem(
+        source=SOURCE_SKILLS,
+        text="\n\n" + text,
+        label="Skills",
+        relevance=rel,
+        stamp=sel.at,
+        meta={
+            "applied": [{"id": a.skill.id, "reason": a.reason} for a in sel.applied],
+            "count": len(sel.applied),
+            "considered": sel.considered,
+            "omitted": len(sel.omitted),
+            "chars": sel.chars,
+            "truncated": sel.catalog_truncated,
+        },
+    )]
 
 
 @collector(SOURCE_WORKFLOW)
 def _collect_workflow(req: ContextRequest) -> list[ContextItem]:
-    """Nothing yet — Phase 12 replaces this via `register(SOURCE_WORKFLOW, …)`."""
-    return []
+    """The workflow this turn is a node of, from `core.workflow` (Task 37).
+
+    ⚠️ **THE STATE IS NOT DERIVED HERE.** `workflow.for_turn()` owns it — which run
+    is live, which node is current, what is still blocked and the character ceiling
+    the block may spend — and this collector renders what it returns. Exactly the
+    split `_collect_skills` documents, for the same reason: the slot was declared
+    empty in Task 20 so that Phase 12 could fill it *without* the broker learning a
+    workflow fact of its own. `runner.state_for()` is the one progress answer, and a
+    second one here would let the prompt describe a run the `/workflow` panel does
+    not recognise.
+
+    ⚠️ **`relevance` IS PRE-STATED AT 1.0.** A live workflow is not lexically
+    related to the message — the message is usually the node's own work — and
+    `sources.measure()`'s generic word-overlap pass would score it near the floor
+    and make it the first thing a tight budget discards. That is backwards: the one
+    block that says *do not redo a finished node* is the one a truncated turn most
+    needs. It is scored, not pinned: `ALWAYS` stays the two standing instruction
+    blocks, so an over-budget turn can still drop this ahead of the user's rules.
+
+    A turn with no live run pays one indexed `exec_workflows` read and returns
+    nothing. `meta` carries counts and node **ids** only — never an instruction.
+    """
+    from agent2.core import workflow as _wf
+
+    view = _wf.for_turn(chat_id=req.chat_id, project=(req.project or None))
+    text = view.get("text") or ""
+    if not view.get("active") or not text:
+        return []
+    run = view.get("run") or {}
+    return [ContextItem(
+        source=SOURCE_WORKFLOW,
+        text="\n\n## WORKFLOW IN PROGRESS\n" + text,
+        label="Workflow",
+        relevance=1.0,
+        meta={
+            "run_id": run.get("run_id", ""),
+            "name": run.get("name", ""),
+            "current": run.get("current", ""),
+            "done": run.get("done", 0),
+            "total": run.get("total", 0),
+            "failed": run.get("failed", 0),
+            "omitted": view.get("omitted", 0),
+            "truncated": bool(view.get("truncated")),
+        },
+    )]
 
 
 @collector(SOURCE_MEMORY)
@@ -785,6 +896,14 @@ def collect(req: ContextRequest) -> ContextBundle:
     later phase gets priority, relevance, token cost and freshness for free instead
     of arriving unmeasured and ranking last by accident. A collector that stated a
     value keeps it — `measure()` only fills `None`.
+
+    ⚠️ SO DOES `memory.retrieval` (Task 27), and per SOURCE rather than for the
+    memory collector alone. Task 27 asks for "memory retrieval latency"; the same
+    timer around the same loop answers it for all ten sources at a bounded ten
+    labels, and the useful form of the question is comparative — a `git_state`
+    source that has started taking 400 ms is invisible in a number that only
+    watches `memory`. A collector that raises is timed too: its failure took time,
+    and a source that fails slowly is the one worth finding.
     """
     with _REG_LOCK:
         table = dict(_COLLECTORS)
@@ -795,7 +914,8 @@ def collect(req: ContextRequest) -> ContextBundle:
         if fn is None or not req.wants(source):
             continue
         try:
-            got = fn(req) or []
+            with _metrics.timer(_metrics.MEMORY_RETRIEVAL, source):
+                got = fn(req) or []
         except Exception as exc:                      # never into a turn
             bundle.errors[source] = f"{type(exc).__name__}: {exc}"[:200]
             continue
@@ -814,9 +934,34 @@ def assemble(**kwargs) -> ContextBundle:
     the one turn that overflows the window. `collect()` stays pure gathering so a
     report can still show what was collected *before* the trim — `bundle.items` is
     everything, `bundle.sent()` is what fits, and `bundle.plan` is the difference.
+
+    ⚠️ THE PER-SOURCE FAILURE IS LOGGED HERE TOO, FOR THE SAME REASON THE TRIM IS.
+    `agent.py` and `llm/provider_agent.py` each carried their own copy of this loop
+    and `agent2cli.py` would have made a third — and a warning emitted per surface
+    ends up emitted by only *some* of them: the loop nobody remembered then loses a
+    source with no record anywhere, which is the one thing
+    `context_source_failed` exists to make visible. It lives in `assemble()` rather
+    than in `collect()` so that `collect()` stays the pure gathering step a report
+    or a dry-run can call without writing to the audit log.
+
+    ⚠️ `context.size` IS RECORDED HERE, AND IT IS `plan.used` — WHAT WAS SENT, NOT
+    WHAT WAS COLLECTED (Task 27). The two differ by exactly the trim, and the
+    interesting number is the one the vendor was charged for; reading `items`
+    instead would report a prompt that was never sent, which is the failure
+    `sent()` exists to prevent. It is recorded after `apply()` for the same reason,
+    and only when a plan exists — a hand-built bundle has no `plan`, and "nobody
+    planned one" is not the same fact as "nothing was dropped".
     """
     bundle = collect(request(**kwargs))
+    for _src, _err in bundle.errors.items():
+        try:
+            from agent2.core import logging as _alog
+            _alog.context_source_failed(_src, _err)
+        except Exception:
+            pass
     _budget.apply(bundle)
+    if bundle.plan is not None:
+        _metrics.observe(_metrics.CONTEXT_SIZE, bundle.plan.used)
     return bundle
 
 
@@ -843,7 +988,12 @@ def base_tail() -> str:
 
 
 def stats() -> dict:
-    """Broker posture, for `/api/health` and `/api/context`. Counters only."""
+    """Broker posture — counters and policy only, never any item's text.
+
+    Read by `/api/health`'s context section (Task 28). Deliberately says nothing
+    about a specific turn: a ceiling depends on that turn's model and mode, and the
+    project key is a user's absolute working directory.
+    """
     return {
         "sources": list(ORDER),
         "registered": registered(),

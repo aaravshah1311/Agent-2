@@ -12,6 +12,36 @@ was launched. Chats are tagged with their cwd at creation time. Loading
 history for a session only returns chats belonging to that cwd.
 
 Cross-project access is intentional only (e.g. /resume picker).
+
+⚠️ THIS MODULE ALSO OWNS *CONTINUITY* — "carry on from where you stopped".
+`last_session()` is the ONE declaration of which conversation that is, and
+`resume_mode()` the ONE declaration of whether it happens by itself. Three
+surfaces ask (the CLI at launch, the browser on first load, and `/load`), and a
+second selection rule is the drift this module exists to prevent: the terminal
+would carry on in one conversation while the browser opened another, each half
+looking perfectly correct on its own — and in dual mode that is one process pair
+over one database, so the two would then take turns overwriting each other's
+`messages` window.
+
+Three properties of that rule are load-bearing, and each is pinned:
+  * **`status='active'` only.** `/pause` parks a conversation deliberately and
+    tells the user to type `/resume`; resurrecting it at the next launch would
+    make `/pause` mean nothing.
+  * **It must have messages.** The Web UI creates its chat row up front, so the
+    newest row for a project is routinely an empty one. Resuming that is not
+    continuity, it is a no-op that *looks* like continuity — and it costs the
+    real transcript, because it hides the conversation that does have content.
+  * **Nothing here raises.** All three callers ask on a startup path, before
+    there is a REPL or a bound socket to report an error to, so a DB hiccup
+    degrades to "nothing to resume" and the surface starts clean.
+
+⚠️ **CONTINUING IS OPT-IN — `resume_mode()` DEFAULTS TO `off`.** A launch starts
+clean on both surfaces; `/load` and `--continue` (CLI) and the `load` palette
+command (browser) are how a human asks for the last conversation back, and
+`AGENT2_RESUME=last` is the opt-in for anyone who wants it on every launch.
+Selection and policy stay two separate functions precisely because of that: the
+explicit paths call `last_session()` **without** consulting `auto_resume()`, so
+turning the automatic half off can never make the deliberate half unreachable.
 """
 
 import os
@@ -38,6 +68,25 @@ def project_key(path: str | None = None) -> str:
 def current_cwd() -> str:
     """Canonical cwd string used as the project key."""
     return project_key()
+
+
+# ── The order a conversation is in ─────────────────────────────────────────────
+# ⚠️ ONE declaration, and the `rowid` tie-break is the entire reason it exists.
+#
+# `created_at` is SECOND-granular; `cli/store.save_history()` rewrites a whole
+# window inside one batch, so every row of a resumed CLI conversation carries the
+# SAME timestamp. And `idx_messages_chat_created` is `(chat_id, created_at DESC)`
+# — so a bare `ORDER BY created_at` is served by walking that index BACKWARDS,
+# and a fully-tied conversation comes back **reversed, end to end**, with no
+# error and nothing on screen to point at. Measured, not theorised: a 152-message
+# resume returned newest-first.
+#
+# `agent.build_context()` was fixed for exactly this and its docstring explains
+# it — and then five more readers each spelled their own clause, four of which
+# still had the bug. That is what a second declaration costs here, so there is
+# now one: every reader of `messages` interpolates one of these two names.
+MSG_ORDER = "ORDER BY created_at, rowid"                  # oldest first
+MSG_ORDER_DESC = "ORDER BY created_at DESC, rowid DESC"   # newest first
 
 
 # ── Chat lifecycle ─────────────────────────────────────────────────────────────
@@ -96,8 +145,14 @@ def resume_chat(chat_id: str) -> None:
 # Chat rows carry a msg_count so callers can tell an empty chat from a used one
 # without a second query per chat. Only user/assistant turns count: a chat whose
 # only rows are tool_call/tool_result has nothing to show and reads as empty.
-_MSG_COUNT = ("(SELECT COUNT(*) FROM messages m WHERE m.chat_id = chats.id "
-              "AND m.role IN ('user','assistant')) AS msg_count")
+#
+# ⚠️ The EXPRESSION is the one declaration, not the projection: `list_chats_for_cwd`
+# selects it as a column and `last_session()` filters on it, and those two must
+# agree about what "has messages" means or the browser's chat list would show a
+# count for a conversation continuity refuses to open.
+_MSG_COUNT_EXPR = ("(SELECT COUNT(*) FROM messages m WHERE m.chat_id = chats.id "
+                   "AND m.role IN ('user','assistant'))")
+_MSG_COUNT = f"{_MSG_COUNT_EXPR} AS msg_count"
 
 
 def list_chats_for_cwd(cwd: str | None = None, limit: int | None = None) -> list[dict]:
@@ -124,3 +179,113 @@ def get_or_create_chat(model: str, mode: str) -> dict:
     if chat:
         return chat
     return new_chat(model, mode)
+
+
+# ── Continuity — "carry on from where you stopped" ─────────────────────────────
+
+RESUME_ENV = "AGENT2_RESUME"
+RESUME_MODES = ("last", "off")
+RESUME_DEFAULT = "off"
+
+
+def resume_mode() -> str:
+    """Whether a fresh surface continues by itself: ``off`` (default) or ``last``.
+
+    ⚠️ **CONTINUING UNASKED IS OPT-IN, AND THE REVERSAL IS DELIBERATE.** This
+    shipped as ``last``: every launch reopened whatever this directory had last
+    been discussing, and printed a line saying so. That is the wrong default, for
+    a reason the selection rules above cannot express — a new session is far more
+    often a new question than the next sentence of the old one, and an unasked
+    resume is not free. `cli/store.save_history()` DELETEs a chat's rows and
+    re-INSERTs the window, so the first turn of a session that continued by
+    accident rewrites the transcript the user did not mean to open. Starting clean
+    costs a keystroke; continuing by accident costs the conversation.
+
+    ⚠️ An unrecognised value falls back to `RESUME_DEFAULT` — now ``off``. The
+    rule is unchanged and so is its direction: fall back to the answer that
+    surprises nobody, exactly as `AGENT2_WEB_ROLE` falls to `viewer` and
+    `AGENT2_CONTEXT_ISOLATION` to `project`. While this was on by default the safe
+    end was ``last``, because a typo must not silently disable a feature somebody
+    was relying on; now that it is off by default the safe end is ``off``, because
+    a typo must not silently reopen a conversation nobody asked for. It is the
+    default that moved, not the principle.
+
+    ⚠️ **POLICY IS NOT SELECTION.** This governs the *automatic* resume and
+    nothing else — `/load`, `--continue` and the `/resume` picker are the user
+    asking out loud, and an explicit ask is never governed by a default. Reading
+    this one flag as "may anything reopen a conversation" would make it quietly
+    delete three commands, which is the failure mode rule 28 names: a plausible
+    setting doing more than it says. That cuts both ways now: `off` being the
+    default is precisely why the explicit paths must stay exempt, or the feature
+    would be unreachable rather than opt-in.
+    """
+    raw = (os.environ.get(RESUME_ENV) or "").strip().lower()
+    return raw if raw in RESUME_MODES else RESUME_DEFAULT
+
+
+def auto_resume() -> bool:
+    """True when a launching surface should continue the last conversation itself.
+
+    False by default — see `resume_mode()`. `AGENT2_RESUME=last` is the opt-in
+    that restores the behaviour this shipped with, for anyone who wants it.
+    """
+    return resume_mode() == "last"
+
+
+def last_session(cwd: str | None = None) -> dict | None:
+    """THE conversation "carry on where you stopped" means — or None.
+
+    ⚠️ ONE declaration, three callers: the CLI at launch, `GET /api/chats/resume`
+    on the browser's first paint, and `/load`. A second rule anywhere means the
+    terminal continues one conversation while the tab opens another — and in dual
+    mode both halves then rewrite the same `messages` window in turn.
+
+    Three filters, each load-bearing and each pinned:
+      * `status='active'` — a **paused** chat was parked on purpose and says
+        "/resume to continue"; reviving it at the next launch makes `/pause` a
+        no-op the user cannot see.
+      * `{_MSG_COUNT_EXPR} > 0` — the Web UI creates its row up front, so the
+        newest row for a project is routinely *empty*. Opening that is not
+        continuity, and it costs the real transcript by hiding it.
+      * this project only — `cwd` is the isolation boundary; crossing it is the
+        `/resume` picker's job, and only ever because a human chose a row.
+
+    Total by contract: every caller asks before there is a REPL or a socket to
+    report to, so any failure degrades to "nothing to resume".
+    """
+    try:
+        return qone(
+            # Interpolates module constants only — never a caller's string.
+            f"SELECT *, {_MSG_COUNT} FROM chats "
+            f"WHERE cwd=? AND status='active' AND {_MSG_COUNT_EXPR} > 0 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (cwd or current_cwd(),),
+        )
+    except Exception:  # noqa: BLE001 — see above; startup path, no reporting surface
+        return None
+
+
+def resumable(cwd: str | None = None) -> dict | None:
+    """`last_session()` as a payload a surface can render, or None.
+
+    ⚠️ Carries the chat's *identity and size*, **never its text**: the transcript
+    already has one reader (`GET /api/chats/<cid>`), and a second one shaped like
+    a status probe is how message content ends up somewhere nobody audits.
+
+    ⚠️ It answers *what*, not *whether* — `auto_resume()` answers that, and the
+    two stay apart for the same reason `resume_mode()`'s docstring gives. Folding
+    the policy in here would put the same boolean in two places inside one
+    payload, and a client reading the wrong one would resume against a policy
+    that says not to.
+    """
+    row = last_session(cwd)
+    if not row:
+        return None
+    return {
+        "id": str(row.get("id") or ""),
+        "title": str(row.get("title") or "New Chat"),
+        "model": str(row.get("model") or ""),
+        "mode": str(row.get("mode") or ""),
+        "messages": int(row.get("msg_count") or 0),
+        "updated_at": str(row.get("updated_at") or ""),
+    }

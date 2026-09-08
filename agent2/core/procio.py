@@ -12,6 +12,13 @@ per-surface and got them subtly wrong in different ways:
                       pipe can fill up and block the child.
   2. `terminate_tree()` — end a process AND its descendants.
 
+Task 25 added the pid-only forms of the second job — `pid_alive()` and
+`terminate_pid()` — because crash recovery meets a `process_id` in a database row
+whose `Popen` died with the process that created it. They live here, not in
+`core/recovery/`, so that "is it alive" and "how do we reach its tree" keep having
+one answer per platform. ⚠️ Both are strictly weaker than the handle forms and say
+so in their docstrings: a caller holding a `Popen` must use `terminate_tree()`.
+
 ⚠️ THE DEADLOCK THIS FIXES (reproduced before the fix, on Windows)
 ───────────────────────────────────────────────────────────────────
 The CLI runner used to read stdout to EOF and only afterwards read stderr:
@@ -216,6 +223,158 @@ def _kill_tree_win(pid: int) -> bool:
             timeout=5, check=False,
         )
         return res.returncode == 0
+    except Exception:
+        return False
+
+
+def pid_alive(pid) -> bool | None:
+    """Does a process with this pid exist right now? THE liveness question.
+
+    Added for Task 25 §5 — crash recovery finds a `process_id` in a ledger row
+    written by a process that is gone, and has to ask about it with no `Popen` in
+    hand. It lives here rather than in `core/recovery/` for the same reason the tree
+    kill does: this module owns process plumbing, and a second `os.kill(pid, 0)`
+    inside recovery would be a second declaration that drifts the day Windows or a
+    permission case is handled differently in one of them.
+
+    THREE ANSWERS, and the third is load-bearing: `True`, `False`, and `None` for
+    *"we could not find out"* — the same "unknown is not no" discipline
+    `llm/capabilities.py` documents. A caller that folded `None` into `False` would
+    conclude a process is gone because the platform declined to say.
+
+    ⚠️ **A `True` MEANS "A PROCESS WITH THAT NUMBER EXISTS", NOT "*THAT* PROCESS
+    EXISTS".** pids are recycled, and telling the two apart needs a process start
+    time, which no stdlib call exposes portably. So `True` means only *"cannot prove
+    it is gone"*, and recovery treats it as a reason to ask a human — never as a
+    licence to kill or to repeat. `PermissionError` is a True: the process is there,
+    it simply is not ours to signal.
+    """
+    try:
+        num = int(pid)
+    except Exception:
+        return None
+    if num <= 0:
+        return None
+    if IS_WIN:
+        return _pid_alive_win(num)
+    try:
+        os.kill(num, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
+
+def _pid_alive_win(num: int) -> bool | None:
+    """Windows has no `kill(pid, 0)`; ask the kernel for a handle instead.
+
+    `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) is the least privilege that
+    answers the question, and `STILL_ACTIVE` (259) is what separates a live process
+    from a zombie whose handle someone still holds. `ERROR_INVALID_PARAMETER` is
+    how Windows reports "no such pid"; `ERROR_ACCESS_DENIED` means it exists and
+    belongs to another user, which is alive for our purposes.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, num)
+        if not handle:
+            err = ctypes.get_last_error()
+            if err == 87:            # ERROR_INVALID_PARAMETER — no such process
+                return False
+            if err == 5:             # ERROR_ACCESS_DENIED — it exists
+                return True
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            return code.value == 259     # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def terminate_pid(pid, *, grace: float = 2.0) -> bool:
+    """End a process (and its tree where the platform allows) given only its pid.
+
+    ⚠️ **THE `Popen` FORM IS THE ONE TO USE WHENEVER A HANDLE EXISTS.** With a
+    handle, `terminate_tree()` can signal the child's whole process group, refuse to
+    signal our own, and confirm the exit through `poll()` — none of which is
+    possible from a bare number. This form exists for exactly one case, the one
+    Task 25 §5 names: an orphan whose parent Agent2 process died, so the handle went
+    with it. A caller with a live `Popen` that reached for this instead would be
+    trading a group kill for a single-process kill and calling it the same thing.
+
+    ⚠️ **IT REFUSES TO SIGNAL OUR OWN PROCESS OR GROUP.** An orphan's pid comes out
+    of a database row written by a previous run, and pids are recycled — so the
+    number in that row may by now BE us, or a sibling in our own group. Killing
+    Agent2 to clean up after a crash would be a spectacular way to fail, and this is
+    the check that prevents it.
+
+    Never raises: a pid that has already exited, a recycled one and a platform
+    without `killpg` all mean "there is nothing left to kill", which is the caller's
+    definition of success.
+    """
+    try:
+        num = int(pid)
+    except Exception:
+        return False
+    if num <= 0 or num == os.getpid():
+        return False
+    if pid_alive(num) is False:
+        return True
+
+    if IS_WIN:
+        _kill_tree_win(num)
+    else:
+        import signal
+        if not _signal_pgid(num, signal.SIGTERM):
+            try:
+                os.kill(num, signal.SIGTERM)
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + max(0.0, grace)
+    while time.monotonic() < deadline:
+        if pid_alive(num) is False:
+            return True
+        time.sleep(0.05)
+
+    if IS_WIN:
+        _kill_tree_win(num)
+    else:
+        import signal
+        if not _signal_pgid(num, signal.SIGKILL):
+            try:
+                os.kill(num, signal.SIGKILL)
+            except Exception:
+                pass
+    time.sleep(0.05)
+    return pid_alive(num) is not True
+
+
+def _signal_pgid(num: int, sig) -> bool:
+    """Signal a pid's process group (POSIX), refusing our own — see `_signal_group`.
+
+    The pid form of the same guard, and it carries one extra condition: the group is
+    only signalled when the pid *is* the group leader. Agent2 spawns children with
+    `start_new_session`, so its own children are leaders; a pid that is not one
+    belongs to a group somebody else created, and signalling that whole group would
+    reach processes this recovery never heard of.
+    """
+    try:
+        pgid = os.getpgid(num)
+        if pgid == os.getpgrp() or pgid != num:
+            return False
+        os.killpg(pgid, sig)
+        return True
     except Exception:
         return False
 

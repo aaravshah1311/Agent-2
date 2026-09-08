@@ -44,11 +44,16 @@ behaviour rather than breaking anything. (test_wal_checkpoint.py)
 
 INDEXES
 ───────
-10 indexes, applied ONE AT A TIME so a failure costs one index rather than nine,
-and ⚠️ applied AFTER `_apply_migrations()`: `idx_chats_cwd_updated` and
-`idx_memories_rank` index columns that migrations add, so reordering breaks a
-fresh DB. `_log_index_failure` is a deliberate graceful-degradation path — an
-app with a slow query still works.
+`_INDEXES` is the declaration — applied ONE AT A TIME so a failure costs that one
+index rather than every index declared after it, and ⚠️ applied AFTER
+`_apply_migrations()`: `idx_chats_cwd_updated` and `idx_memories_project_rank`
+index columns that migrations add, so reordering breaks a fresh DB.
+`_log_index_failure` is a deliberate graceful-degradation path — an app with a
+slow query still works. ⚠️ The count is deliberately NOT written down here: it
+has been wrong twice, because a migration that adds an index (17, 18, 29) never
+touches this list, and a census a reader cannot trust is worse than no census.
+`len(_INDEXES)` is the answer, and `sqlite_master` is the answer for what a live
+DB actually has.
 
 SCHEMA MIGRATIONS — a versioned ledger, not ALTERs in try/except: pass
 ─────────────────────────────────────────────────────────────────────
@@ -643,6 +648,28 @@ def _add_column(table: str, col: str, typedef: str):
     return step
 
 
+def _create_index(name: str, table: str, cols: str):
+    """Build an idempotent 'add this index if missing' migration step.
+
+    ⚠️ AN INDEX ADDED TO AN EXISTING TABLE'S DDL NEEDS ONE OF THESE, ALWAYS.
+    `_create_table` returns early when the table is already there — so adding a
+    `CREATE INDEX` line to a DDL whose migration has already been recorded is a
+    change that only ever reaches *fresh* databases. The install that has been
+    running for months, and therefore has the most rows to scan, is precisely the
+    one that would silently never get the index.
+    """
+    if not (_IDENT_OK.match(name) and _IDENT_OK.match(table)):
+        raise ValueError(f"unsafe identifier in migration: {name} on {table}")
+
+    def step(c: sqlite3.Connection) -> None:
+        if not _table_exists(c, table):
+            return
+        c.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({cols})")
+
+    step.__name__ = f"index_{name}"
+    return step
+
+
 def _create_table(table: str, ddl: str):
     """Build an idempotent 'create this table if missing' migration step.
 
@@ -694,6 +721,19 @@ _TASK_SESSIONS_DDL = """
 # `seq` is the display order the model asked for; `status` is one of
 # core.tasks.TaskStatus. `dependencies` and `checkpoint` are JSON text because
 # SQLite has no array/object type and both are read whole, never queried into.
+#
+# The last four columns are Task 24 §2's durable recovery fields. ⚠️ They are ALSO
+# declared as migrations 23–26, and both halves are required for the reason
+# `memories.project` states below: this statement is what a FRESH database gets,
+# the migrations are what an EXISTING one gets, and dropping either leaves one of
+# the two populations querying a column its table does not have.
+#
+# ⚠️ `updated_at` DEFAULTS TO `datetime('now')` HERE BUT TO `''` IN MIGRATION 23,
+# and the difference is deliberate. A brand-new row has genuinely just been
+# updated. An ALTER cannot express a per-row default, so migration 23 lands `''`
+# and migration 27 backfills each row from the timestamp it already carries —
+# stamping every historical task with the moment of the upgrade instead would
+# claim they all changed when the user ran the installer.
 _AGENT_TASKS_DDL = """
     CREATE TABLE IF NOT EXISTS agent_tasks (
         id             TEXT PRIMARY KEY,
@@ -712,8 +752,17 @@ _AGENT_TASKS_DDL = """
         progress       REAL DEFAULT 0.0,
         result         TEXT DEFAULT '',
         error          TEXT DEFAULT '',
-        checkpoint     TEXT DEFAULT '{}'
+        checkpoint     TEXT DEFAULT '{}',
+        updated_at     TEXT NOT NULL DEFAULT(datetime('now')),
+        last_heartbeat TEXT NOT NULL DEFAULT '',
+        worker_id      TEXT NOT NULL DEFAULT '',
+        execution_id   TEXT NOT NULL DEFAULT ''
     );
+    -- Worker recovery's one query: "which tasks is some process holding, and how
+    -- long since anything touched them". Without this index `stale_running()` is a
+    -- full scan of every task the install has ever recorded, on the startup path.
+    CREATE INDEX IF NOT EXISTS idx_agent_tasks_live
+        ON agent_tasks(status, updated_at);
 """
 
 
@@ -802,6 +851,38 @@ _MCP_CONFIG_DDL = """
         url          TEXT DEFAULT '',
         security_key TEXT DEFAULT '',
         updated_at   TEXT DEFAULT(datetime('now'))
+    );
+"""
+
+
+# ── Skill enablement schema (migration 29) ────────────────────────────────────
+# Phase 11, Task 35. Which skills in `.agent2/skills/` are switched on, PER
+# PROJECT. Keyed `(project, skill_id)` for the same reason `mcp_state` is: "use the
+# security-audit skill here" is a statement about this checkout, and one row per
+# skill would make it a statement about every checkout on the machine.
+#
+# ⚠️ `skill_id` IS THE PATH-DERIVED, LOWER-CASED RELATIVE PATH, never the skill's
+# display `name`. A user editing their own `name:` line would otherwise silently
+# orphan the row and their enabled skills would read as never-chosen — and the fold
+# to lower case is what stops one repository from holding two rows for one skill
+# depending on whether it was toggled from a Windows or a Linux checkout.
+#
+# ⚠️ ABSENCE IS A THIRD STATE, NOT A FALSE. No row means *never chosen*, which is
+# what lets an auto-relevant skill apply while an explicitly disabled one stays off
+# (Task 36's ordering). A schema that could only say on/off would force discovery
+# to invent a default for every file it finds, and the invented default is exactly
+# what a user would then have to override one skill at a time.
+#
+# `project` DEFAULTs to `''` — `broker.isolation.SHARED` — so a writer that reaches
+# this table without stamping produces a row visible in every project rather than
+# invisible in all of them, the same direction migration 17/18 chose.
+_SKILL_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS skill_state (
+        project    TEXT NOT NULL DEFAULT '',
+        skill_id   TEXT NOT NULL,
+        enabled    INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT DEFAULT(datetime('now')),
+        PRIMARY KEY (project, skill_id)
     );
 """
 
@@ -896,6 +977,221 @@ _MODEL_ATTEMPTS_DDL = """
         ON model_attempts(created_at DESC);
 """
 
+# ── Durable execution state (Task 24) ─────────────────────────────────────────
+# Phase 8's question is "what was in flight when this process died?", and before
+# these three tables four of the seven things Task 24 names were already durable
+# (`task_sessions`, `agent_tasks`, its `parent_task_id` tree, its `checkpoint`
+# column) while three were not: commands lived only in `core/commands.py`'s
+# in-memory registry, tool calls were recorded only as checkpoint steps of a
+# RUNNING task — so nothing at all was written when no task session existed — and
+# workflow runs had no representation anywhere.
+#
+# `agent2/core/execstate.py` owns what the columns MEAN; this is the storage.
+#
+# ⚠️ THESE ARE A DURABLE SHADOW, NOT A SECOND SOURCE OF TRUTH. While a process
+# lives, `core/commands.py`'s registry is the authority and these rows follow it;
+# they matter only once that process is gone. That ordering is why `execstate` may
+# be lossy (it swallows every failure) without making anything wrong: a missing
+# row costs a recovery hint, never a correct answer to a live question.
+#
+# ⚠️ `instance` IS WHAT MAKES A CRASH DETECTABLE. It identifies the process that
+# wrote the row, so a *foreign* row still marked active past `EXEC_STALE_SEC` is
+# how "someone died holding this" is inferred. Without it a restart could not tell
+# its own abandoned rows from a live sibling's in dual mode, where two processes
+# share one agent2.db by design.
+#
+# ⚠️ NO stdout/stderr COLUMN, DELIBERATELY. `core/commands.py` keeps 4 KB of each
+# in memory for the model; persisting them would (a) turn agent2.db into a log
+# store on a busy install and (b) write whatever a command happened to print —
+# tokens, passwords, `env` dumps — into a file the secrets work exists to keep
+# credentials out of. Recovery needs to know THAT a command was running, not what
+# it said. `error` is kept because it holds our own short reason string, not the
+# child's output.
+_EXEC_COMMANDS_DDL = """
+    CREATE TABLE IF NOT EXISTS exec_commands (
+        id             TEXT PRIMARY KEY,
+        instance       TEXT DEFAULT '',
+        project        TEXT DEFAULT '',
+        session_id     TEXT DEFAULT '',
+        task_id        TEXT DEFAULT '',
+        surface        TEXT DEFAULT '',
+        term_id        TEXT DEFAULT '',
+        command        TEXT DEFAULT '',
+        process_id     INTEGER,
+        status         TEXT DEFAULT 'created',
+        exit_code      INTEGER,
+        output_lines   INTEGER DEFAULT 0,
+        error          TEXT DEFAULT '',
+        created_at     TEXT DEFAULT '',
+        started_at     TEXT DEFAULT '',
+        last_output_at TEXT DEFAULT '',
+        completed_at   TEXT DEFAULT '',
+        updated_at     TEXT DEFAULT(datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_commands_live
+        ON exec_commands(status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_exec_commands_project
+        ON exec_commands(project, updated_at DESC);
+    -- Migration 30. `verify.evidence_for()` reads this ledger and its twin with the
+    -- SAME predicate — `project=? AND session_id=?` — and only the twin had a
+    -- session index, so one half of every verification report used a selective
+    -- index while the other scanned a project. Measured on the real query:
+    -- 0.14→0.08 ms at 500 rows, 1.24→0.60 at 5 000, 9.40→3.44 at 50 000.
+    -- ⚠️ ONE column, not `(project, session_id, updated_at DESC)`: the composite
+    -- was measured too and is SLOWER past 500 rows (0.90 vs 0.60 ms at 5 000) —
+    -- `session_id` is the selective term, so prefixing `project` only widens the
+    -- key. Both plans still spend `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` on
+    -- the `rowid DESC` tie-break, which no index of ours can satisfy (SQLite
+    -- appends rowid ASCENDING), but over matching rows only.
+    CREATE INDEX IF NOT EXISTS idx_exec_commands_session
+        ON exec_commands(session_id, updated_at DESC);
+"""
+
+# One row per tool call. ⚠️ THIS IS THE TABLE THAT CLOSES A REAL GAP rather than
+# duplicating `checkpoint.steps`: `tasks.note_tool()` returns immediately unless a
+# task is RUNNING, so a destructive tool call made outside a task session — which
+# is most of them — left no durable trace whatsoever. Task 26 has to be able to
+# ask "did that `delete_file` already happen?" after a crash, and it can only ask
+# about calls something wrote down.
+#
+# `status` reuses `core/tasks.STEP_*` (`running`/`completed`/`failed`) on purpose:
+# the checkpoint step and the ledger row describe the SAME event, and two
+# spellings of "completed" would make a joined recovery report contradict itself.
+_EXEC_TOOL_CALLS_DDL = """
+    CREATE TABLE IF NOT EXISTS exec_tool_calls (
+        id           TEXT PRIMARY KEY,
+        instance     TEXT DEFAULT '',
+        project      TEXT DEFAULT '',
+        session_id   TEXT DEFAULT '',
+        task_id      TEXT DEFAULT '',
+        chat_id      TEXT DEFAULT '',
+        surface      TEXT DEFAULT '',
+        tool         TEXT DEFAULT '',
+        detail       TEXT DEFAULT '',
+        destructive  INTEGER DEFAULT 0,
+        status       TEXT DEFAULT 'running',
+        ok           INTEGER,
+        error        TEXT DEFAULT '',
+        started_at   TEXT DEFAULT '',
+        completed_at TEXT DEFAULT '',
+        updated_at   TEXT DEFAULT(datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_tool_calls_live
+        ON exec_tool_calls(status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_exec_tool_calls_session
+        ON exec_tool_calls(session_id, updated_at DESC);
+    -- Migration 31, and the mirror of 30: this ledger had the session index its
+    -- twin lacked and lacked the project index its twin had. `execstate.interrupted()`
+    -- is the reader that pays — the crash scan on the STARTUP path, which asks all
+    -- three exec_* tables `status NOT IN (…) AND instance<>? AND updated_at<? AND
+    -- project=?`. `status NOT IN` is not an equality term, so `project` is the only
+    -- one an index can serve, and without it SQLite fell back to a skip-scan over
+    -- the `live` index — then, past ~50 000 rows, over the SESSION index, which is
+    -- worse: 1.83→0.58 ms at 5 000 rows, 42.2→2.05 ms at 50 000.
+    -- ⚠️ `_trim()` refuses to evict an unsettled row, so this table is ALLOWED to
+    -- exceed `EXEC_LEDGER_MAX` — the 50 000-row column is a real install, not a
+    -- hypothetical, and it is the one where the old plan degraded rather than
+    -- merely slowed.
+    CREATE INDEX IF NOT EXISTS idx_exec_tool_calls_project
+        ON exec_tool_calls(project, updated_at DESC);
+"""
+
+# Workflow runs. ⚠️ DECLARED NOW, WRITTEN BY PHASE 12 — the same discipline the
+# Context Broker uses for its `skills` / `workflow_state` sources, which exist in
+# `ORDER` with empty collectors. Task 24 says to track workflow runs, and Task 25
+# has to report "✓ Restored workflow state" honestly; both need a name, a shape
+# and a slot in the report *before* the executor exists, so that Phase 12 adds
+# workflows by CALLING this module rather than by editing recovery, the CLI and
+# the web surface to learn about a fourth kind of thing.
+#
+# `state` is a JSON blob owned by the future executor: this module stores and
+# returns it verbatim and never interprets it, so Phase 12 does not need a
+# migration to add a field to its own progress record.
+_EXEC_WORKFLOWS_DDL = """
+    CREATE TABLE IF NOT EXISTS exec_workflows (
+        id           TEXT PRIMARY KEY,
+        instance     TEXT DEFAULT '',
+        project      TEXT DEFAULT '',
+        session_id   TEXT DEFAULT '',
+        chat_id      TEXT DEFAULT '',
+        name         TEXT DEFAULT '',
+        status       TEXT DEFAULT 'running',
+        step         TEXT DEFAULT '',
+        step_index   INTEGER DEFAULT 0,
+        total_steps  INTEGER DEFAULT 0,
+        state        TEXT DEFAULT '{}',
+        error        TEXT DEFAULT '',
+        started_at   TEXT DEFAULT '',
+        completed_at TEXT DEFAULT '',
+        updated_at   TEXT DEFAULT(datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_workflows_live
+        ON exec_workflows(status, updated_at DESC);
+    -- Migration 32 — the third table in `interrupted()`'s loop, and it had neither
+    -- of the two indexes 30 and 31 add. Same predicate, same reason, same startup
+    -- path: 3.62→1.34 ms at 5 000 rows, 34.8→1.66 ms at 50 000. A run that a
+    CREATE INDEX IF NOT EXISTS idx_exec_workflows_project
+        ON exec_workflows(project, updated_at DESC);
+"""
+
+# ── Recovery decisions (Task 25) ──────────────────────────────────────────────
+# ONE row per interrupted unit of work, holding every piece of recovery METADATA
+# Task 24 §7 enumerates: recovery_status, recovery_attempts, last_recovery_at,
+# interrupted_at and recovery_reason.
+#
+# ⚠️ A SEPARATE TABLE RATHER THAN SIX COLUMNS ON EACH OF FOUR OTHERS, AND THAT IS
+# THE DESIGN. The units that can be interrupted live in four different tables
+# (`exec_commands`, `exec_tool_calls`, `exec_workflows`, `agent_tasks`) owned by
+# two different modules, and one of them — `agent_tasks` — is Phase 1's and is
+# read by the `/pause` path. Adding recovery columns to it would put recovery
+# state inside the table `tasks.py` owns, where the next writer of a task row
+# decides what "recovery_status" means; four copies of that vocabulary is exactly
+# the drift rule 30 forbids. Keyed by `{kind}:{ref_id}`, this table can describe a
+# unit of any kind without the unit's own table knowing recovery exists.
+#
+# ⚠️ NORMAL / ACTIVE / STALE ARE ABSENT ON PURPOSE. Those three are DERIVED from
+# the execution row (`status` plus `updated_at` against the staleness cutoff), and
+# storing a derived word would create a second opinion about liveness that goes
+# stale the moment the row is touched. A unit with no row here is NORMAL, by
+# construction — which is also why a healthy install writes nothing to this table
+# at all.
+#
+# ⚠️ `evidence` HOLDS DIGESTS AND COUNTERS, NEVER CONTENT. It is how a decision is
+# audited afterwards ("the file was absent before and is absent now"), so it must
+# survive in the DB — and the same reasoning that keeps stdout out of
+# `exec_commands` keeps file bytes, diffs and command output out of here.
+_EXEC_RECOVERY_DDL = """
+    CREATE TABLE IF NOT EXISTS exec_recovery (
+        id             TEXT PRIMARY KEY,
+        kind           TEXT DEFAULT '',
+        ref_id         TEXT DEFAULT '',
+        project        TEXT DEFAULT '',
+        session_id     TEXT DEFAULT '',
+        task_id        TEXT DEFAULT '',
+        instance       TEXT DEFAULT '',
+        recovered_by   TEXT DEFAULT '',
+        status         TEXT DEFAULT 'interrupted',
+        classification TEXT DEFAULT '',
+        operation      TEXT DEFAULT '',
+        disposition    TEXT DEFAULT '',
+        decision       TEXT DEFAULT '',
+        verdict        TEXT DEFAULT '',
+        reason         TEXT DEFAULT '',
+        evidence       TEXT DEFAULT '{}',
+        attempts       INTEGER DEFAULT 0,
+        interrupted_at TEXT DEFAULT '',
+        started_at     TEXT DEFAULT '',
+        completed_at   TEXT DEFAULT '',
+        updated_at     TEXT DEFAULT(datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_exec_recovery_open
+        ON exec_recovery(status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_exec_recovery_project
+        ON exec_recovery(project, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_exec_recovery_session
+        ON exec_recovery(session_id, updated_at DESC);
+"""
+
 
 def _seal_existing_secrets(c) -> None:
     """Replace plaintext credentials with `a2s:` references (Task 16, migration 14).
@@ -954,6 +1250,40 @@ def _seal_existing_secrets(c) -> None:
                 continue
 
 
+def _backfill_task_updated_at(c: sqlite3.Connection) -> None:
+    """Give every pre-existing `agent_tasks` row an `updated_at` (migration 27).
+
+    ⚠️ WITHOUT THIS, AN UPGRADE MISREADS EXACTLY THE ROWS RECOVERY EXISTS TO FIND.
+    Migration 23 adds the column with `DEFAULT ''`, so every historical row reads as
+    the empty string — and `''` sorts BELOW every real timestamp, so
+    `WHERE updated_at <= cutoff` matches the entire table at once and the first
+    launch after an upgrade would report every task ever created as interrupted. The
+    opposite mistake (leaving it NULL, which never compares true) hides them all
+    instead. Both are wrong and both are silent: the panel either shows absurd
+    numbers or stays empty, and neither points at the migration.
+
+    So each row is stamped with the best timestamp it already carries —
+    `completed_at`, else `started_at`, else `created_at` — which is a truthful answer
+    to "when did this row last change" for a row nobody is going to touch again.
+
+    Idempotent by construction: only rows whose `updated_at` is still empty are
+    written, so a resumed partial upgrade re-runs this as a no-op. It is also the
+    LAST version of the group, because it reads the column 23 adds.
+    """
+    if not _table_exists(c, "agent_tasks"):
+        return
+    if not _column_exists(c, "agent_tasks", "updated_at"):
+        return          # 23 did not land; there is nothing to fill
+    c.execute("""
+        UPDATE agent_tasks
+           SET updated_at = COALESCE(NULLIF(completed_at, ''),
+                                     NULLIF(started_at, ''),
+                                     NULLIF(created_at, ''),
+                                     datetime('now'))
+         WHERE updated_at IS NULL OR updated_at = ''
+    """)
+
+
 # (version, name, step). Ordered, applied once, recorded.
 _MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "chats.model",       _add_column("chats", "model", "TEXT DEFAULT 'gemini-2.5-flash'")),
@@ -1008,6 +1338,87 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     # migration ran and vanishing from all the others.
     (17, "memories.project",   _add_column("memories", "project", "TEXT NOT NULL DEFAULT ''")),
     (18, "rules.project",      _add_column("rules", "project", "TEXT NOT NULL DEFAULT ''")),
+    # 19–21 are Phase 8's durable execution state (Task 24) — see the three DDLs
+    # above for what each one exists to answer, and `core/execstate.py` for what
+    # the columns mean. Three versions rather than one for the same reason 6 and 7
+    # are two: the ledger records what was applied, and one row cannot describe
+    # three tables — so an install that fails on the second still records the
+    # first and resumes correctly.
+    (19, "exec_commands",      _create_table("exec_commands", _EXEC_COMMANDS_DDL)),
+    (20, "exec_tool_calls",    _create_table("exec_tool_calls", _EXEC_TOOL_CALLS_DDL)),
+    (21, "exec_workflows",     _create_table("exec_workflows", _EXEC_WORKFLOWS_DDL)),
+    # 22 is Task 25's recovery ledger — one row per interrupted unit, holding the
+    # recovery metadata Task 24 §7 enumerates. See the DDL above for why it is its
+    # own table rather than six columns added to four existing ones, and why the
+    # NORMAL/ACTIVE/STALE third of the vocabulary is deliberately not stored.
+    (22, "exec_recovery",      _create_table("exec_recovery", _EXEC_RECOVERY_DDL)),
+    # 23–27 finish Task 24 §2's *durable task fields* on `agent_tasks`, which had
+    # `created_at`/`started_at`/`completed_at` but no answer to "when did this row
+    # last change" — and therefore no way to ask the one question worker recovery
+    # exists to ask: *which tasks did a worker die holding?*
+    #
+    # ⚠️ `updated_at` IS BACKFILLED, NOT LEFT NULL. `ALTER TABLE ADD COLUMN` gives
+    # every existing row NULL, and `WHERE updated_at <= cutoff` never matches a
+    # NULL — so on an upgraded install every task that was RUNNING when the old
+    # build died would be permanently invisible to recovery while still sitting
+    # there marked RUNNING. That is the exact "stuck in RUNNING forever" §25.6
+    # forbids, arriving through the migration rather than through the bug. The
+    # backfill uses the best timestamp the row already has, and `stale_running()`
+    # still COALESCEs, because two defences against a NULL cost nothing.
+    #
+    # Five versions rather than one for the reason 6/7 and 19–21 are several: one
+    # ledger row cannot describe four `ALTER`s plus a data pass, and a partial
+    # upgrade must resume exactly where it stopped. The backfill is last on purpose
+    # — it reads the column 23 adds, so it can only be correct once 23 has been
+    # recorded as applied.
+    (23, "agent_tasks.updated_at",
+     _add_column("agent_tasks", "updated_at", "TEXT NOT NULL DEFAULT ''")),
+    (24, "agent_tasks.last_heartbeat",
+     _add_column("agent_tasks", "last_heartbeat", "TEXT NOT NULL DEFAULT ''")),
+    # `worker_id` and `execution_id` are §24.3's "which worker was running it" and
+    # "which command/tool call was it in the middle of" — the two links that let a
+    # recovery report name the process and the operation, not just the task.
+    (25, "agent_tasks.worker_id",
+     _add_column("agent_tasks", "worker_id", "TEXT NOT NULL DEFAULT ''")),
+    (26, "agent_tasks.execution_id",
+     _add_column("agent_tasks", "execution_id", "TEXT NOT NULL DEFAULT ''")),
+    (27, "agent_tasks.updated_at.backfill", _backfill_task_updated_at),
+    # 28 is the index behind worker recovery's only query. It is its own version
+    # rather than a line in migration 9's DDL for the reason `_create_index`
+    # explains: 9 is already recorded, so a DDL edit would reach fresh installs
+    # only — and the install with a year of task rows is the one that needs it.
+    (28, "agent_tasks.live_index",
+     _create_index("idx_agent_tasks_live", "agent_tasks", "status, updated_at")),
+    # 29 is Phase 11's per-project skill enablement. A table rather than a column
+    # on anything: a skill is a file on disk, so there is no existing row to hang
+    # "on in this project" from, and `settings` is global by construction — which is
+    # the one thing Task 35's acceptance bar ("state is workspace-aware") rules out.
+    (29, "skill_state", _create_table("skill_state", _SKILL_STATE_DDL)),
+    # 30–32 close the exec ledgers' index asymmetry. Each index is ALSO declared in
+    # its table's DDL above, exactly as migration 28 declares `idx_agent_tasks_live`
+    # in both places, and for the reason `_create_index`'s docstring states: 19, 20
+    # and 21 are already recorded, so a DDL-only edit would reach fresh databases
+    # alone — and the install with a year of ledger rows is the one that needs the
+    # index. The DDL half is what a reader of the schema sees; the migration half is
+    # what an existing install actually gets.
+    #
+    # Three versions rather than one, for migrations 23–27's reason: a step is
+    # recorded as a unit, so three units resume exactly where a partial upgrade
+    # stopped. Each step is independently idempotent (`CREATE INDEX IF NOT EXISTS`
+    # behind a `_table_exists` guard), so a re-run costs nothing either way.
+    #
+    # ⚠️ Every measurement behind these three is in the DDL comment beside the index
+    # itself, not here: the number that justifies an index belongs next to the index,
+    # because that is where the next person deciding whether to drop it will look.
+    (30, "exec_commands.session_index",
+     _create_index("idx_exec_commands_session", "exec_commands",
+                   "session_id, updated_at DESC")),
+    (31, "exec_tool_calls.project_index",
+     _create_index("idx_exec_tool_calls_project", "exec_tool_calls",
+                   "project, updated_at DESC")),
+    (32, "exec_workflows.project_index",
+     _create_index("idx_exec_workflows_project", "exec_workflows",
+                   "project, updated_at DESC")),
 ]
 
 SCHEMA_VERSION = max(v for v, _, _ in _MIGRATIONS)
@@ -1176,19 +1587,19 @@ def _log_index_failure(label: str) -> None:
 def init_db() -> None:
     """Create tables, indexes, and run any pending migrations."""
     c = _conn()
-
-    # WAL is a persistent property of the database FILE, not the connection, so
-    # it only needs setting once — but it must be set before other connections
-    # start writing. Readers then never block the writer and vice versa, which
-    # is what lets dual mode (web thread + CLI process) share one file.
-    wal_on = False
     try:
-        row = c.execute("PRAGMA journal_mode=WAL").fetchone()
-        wal_on = bool(row) and str(row[0]).lower() == "wal"
-    except Exception:
-        pass  # e.g. a network filesystem that refuses WAL — fall back to default
+        # WAL is a persistent property of the database FILE, not the connection, so
+        # it only needs setting once — but it must be set before other connections
+        # start writing. Readers then never block the writer and vice versa, which
+        # is what lets dual mode (web thread + CLI process) share one file.
+        wal_on = False
+        try:
+            row = c.execute("PRAGMA journal_mode=WAL").fetchone()
+            wal_on = bool(row) and str(row[0]).lower() == "wal"
+        except Exception:
+            pass  # e.g. a network filesystem that refuses WAL — fall back to default
 
-    c.executescript("""
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS chats (
             id         TEXT PRIMARY KEY,
             title      TEXT DEFAULT 'New Chat',
@@ -1351,33 +1762,42 @@ def init_db() -> None:
         );
     """)
 
-    # Migration 5 targets `providers`, a table owned by llm/providers.py and
-    # created after this function runs. When it is absent the step is a no-op
-    # and still records — correct, because the CREATE TABLE that follows already
-    # includes `user_agent`. On an OLD db the table is present here and the
-    # column is added for real. init_providers_table() calls ensure_column()
-    # either way as the backstop.
-    _apply_migrations(c)
+        # Migration 5 targets `providers`, a table owned by llm/providers.py and
+        # created after this function runs. When it is absent the step is a no-op
+        # and still records — correct, because the CREATE TABLE that follows already
+        # includes `user_agent`. On an OLD db the table is present here and the
+        # column is added for real. init_providers_table() calls ensure_column()
+        # either way as the backstop.
+        _apply_migrations(c)
 
-    # ── Indexes ───────────────────────────────────────────────────────────────
-    # Every one of these backs a query the app runs on a hot path. Without them
-    # SQLite full-scans `messages` (the largest table by far) on each turn.
-    #
-    # Created AFTER _apply_migrations(), because idx_chats_cwd_updated indexes
-    # `cwd`/`status` — columns that migrations 3 and 4 add. Reordering breaks a
-    # fresh DB.
-    #
-    # Applied one at a time rather than as one executescript: an index is a
-    # performance optimization, so a single failure should cost that ONE index,
-    # not the other nine. As one script, the first error aborts the rest.
-    for label, ddl in _INDEXES:
-        try:
-            c.execute(ddl)
-        except Exception:
-            _log_index_failure(label)
+        # ── Indexes ───────────────────────────────────────────────────────────────
+        # Every one of these backs a query the app runs on a hot path. Without them
+        # SQLite full-scans `messages` (the largest table by far) on each turn.
+        #
+        # Created AFTER _apply_migrations(), because idx_chats_cwd_updated indexes
+        # `cwd`/`status` — columns that migrations 3 and 4 add. Reordering breaks a
+        # fresh DB.
+        #
+        # Applied one at a time rather than as one executescript: an index is a
+        # performance optimization, so a single failure should cost that ONE index,
+        # not every index declared after it. As one script, the first error aborts
+        # the rest.
+        for label, ddl in _INDEXES:
+            try:
+                c.execute(ddl)
+            except Exception:
+                _log_index_failure(label)
 
-    c.commit()
-    c.close()
+        c.commit()
+    finally:
+        # ⚠️ This connection is UNPOOLED — `_conn()` hands out a fresh one and only
+        # this function will ever give it back, so a raising `executescript` or
+        # migration used to leak the handle outright. That is not merely untidy on
+        # Windows: an open handle keeps `agent2.db` locked, which is exactly what
+        # `run.py --reset` / `--uninstall` then cannot delete, and what the next
+        # launch's own `init_db()` can then fail against — a startup error that
+        # reports the *second* symptom and never the first.
+        c.close()
     _init_done.set()
 
     # Only meaningful in WAL mode — there is no -wal file to fold back otherwise.
@@ -1611,9 +2031,18 @@ def migrate_env_keys() -> int:
             migrated += 1
 
     # Retire the legacy .env so it is never read again.
+    # ⚠️ `with_name`, NEVER `with_suffix`: on a dotfile `Path(".env").suffix` is `""`
+    # and the stem is the whole name, so `with_suffix(".env.migrated")` APPENDS —
+    # it produces `.env.env.migrated`. run.py fixed its own copy of this line
+    # (see `_migrate_env_once`) and its `PRESERVE` comment says the doubled name is
+    # legacy and no longer created; that sentence is only true while this writer
+    # agrees, and this is the writer that runs on **every** startup, including the
+    # direct-entry, Docker and install.py paths that never execute run.py at all.
+    # A rename that disagrees with `PRESERVE` is a user's API keys deleted by
+    # `--update`, silently.
     try:
         if ENV is not None and ENV.exists():
-            ENV.rename(ENV.with_suffix(".env.migrated"))
+            ENV.rename(ENV.with_name(".env.migrated"))
     except Exception:
         pass
 

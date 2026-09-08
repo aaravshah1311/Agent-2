@@ -49,6 +49,7 @@ import time
 from dataclasses import dataclass, field
 
 from agent2.core import logging as alog
+from agent2.core import metrics as _metrics
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 # Turns are I/O-bound (waiting on a model), so this is not a CPU count — it caps
@@ -117,6 +118,14 @@ def _worker() -> None:
     caller is responsible for reporting its failure (`_dispatch_agent` already
     does). What matters here is that this thread survives to take the next job.
     A worker lost to an escaped exception is capacity that never comes back.
+
+    ⚠️ QUEUE WAIT IS MEASURED HERE (Task 27) BECAUSE PICKUP IS THE ONLY MOMENT IT
+    IS KNOWABLE. `submit()` records the enqueue stamp and cannot know when a
+    worker will get to the job; `stats()` can report the queue's *depth* but depth
+    is not latency — a queue of one behind a ten-minute turn is a worse wait than
+    a queue of twenty behind fast ones. A job cancelled while queued is recorded
+    too, under its own label: it waited, and how long callers wait before giving
+    up is the number that says the pool is too small.
     """
     me = threading.get_ident()
     while True:
@@ -124,13 +133,22 @@ def _worker() -> None:
         try:
             if job is None:                     # shutdown sentinel
                 return
+            waited = (time.monotonic() - job.enqueued_at) * 1000.0
             with _state_lock:
                 if job in _pending:
                     _pending.remove(job)
-                if job.cancelled.is_set():
+                dropped = job.cancelled.is_set()
+                if dropped:
                     _stats["cancelled"] += 1
-                    continue
-                _running[me] = job
+                else:
+                    _running[me] = job
+            # ⚠️ Outside `_state_lock`. Nothing that is not scheduler state runs
+            # inside it — a metric is cheap, but "cheap" is how a lock held on the
+            # hot path of every turn starts.
+            _metrics.observe(_metrics.QUEUE_WAIT, waited,
+                             "cancelled" if dropped else "run")
+            if dropped:
+                continue
             try:
                 job.fn(*job.args, **job.kwargs)
                 with _state_lock:
@@ -245,18 +263,85 @@ def stats() -> dict:
     return snapshot
 
 
-def shutdown(timeout: float = 2.0) -> None:
-    """Stop the workers. Used by tests and orderly exit, not on the hot path."""
+def _drain_queue() -> int:
+    """Empty `_q`, cancelling the real jobs and discarding stale sentinels.
+
+    Returns how many queued jobs were discarded, so `shutdown()` can account for
+    them instead of leaving `_pending` and `_q` describing different queues.
+    """
+    dropped = 0
+    while True:
+        try:
+            item = _q.get_nowait()
+        except queue.Empty:
+            return dropped
+        try:
+            if item is None:                    # a sentinel nobody claimed
+                continue
+            item.cancelled.set()
+            dropped += 1
+        finally:
+            _q.task_done()
+
+
+def shutdown(timeout: float = 2.0) -> bool:
+    """Stop the workers. Used by tests and orderly exit, not on the hot path.
+
+    Returns True when every worker this call knew about has exited. False means at
+    least one was still busy: it keeps its sentinel and stops when its turn
+    returns, and it stays *tracked* until then.
+
+    ⚠️ THE ORDER IS DRAIN → SIGNAL → JOIN → FORGET ONLY WHAT DIED. Each step is
+    here because the obvious version failed silently, in three different ways:
+
+    * A sentinel posted onto a FULL queue raises `queue.Full`, and swallowing that
+      meant shutting down a **saturated** pool told nobody to stop — and a
+      saturated pool is the one anybody shuts down. Draining first also clears any
+      sentinel an earlier shutdown left behind, which a freshly spawned worker
+      would otherwise take as its own stop order.
+    * `_workers.clear()` made `stats()["workers"]` read 0 whether or not the
+      threads exited, so a worker that outlived its join became unreachable: it
+      could never be signalled again, and it raced the NEXT pool's sentinels. Two
+      pools then drained one queue and the concurrency ceiling this module exists
+      to enforce was quietly doubled — the failure the module's own docstring
+      calls capacity that never comes back, from the other end.
+    * Clearing `_pending` while `_q` still held those jobs left the two describing
+      different queues: `stats()["queued"]` read 0, and a restarted pool ran turns
+      whose callers had already been told they were discarded.
+
+    A still-busy worker is counted as capacity by `start()` in the meantime, which
+    is what stops a restart from stacking a second pool on the first.
+    """
+    ok = True
     with _start_lock:
+        discarded = _drain_queue()
         alive = [t for t in _workers if t.is_alive()]
-        for _ in alive:
+        posted = 0
+        deadline = time.monotonic() + max(0.0, timeout)
+        while posted < len(alive):
             try:
                 _q.put_nowait(None)
             except queue.Full:
-                pass
+                # `maxsize` can legitimately be smaller than the worker count
+                # (AGENT2_MAX_QUEUED_TURNS=1 against eight workers), so room only
+                # appears as workers consume. Wait for it against the deadline
+                # rather than dropping the stop order on the floor.
+                if time.monotonic() >= deadline:
+                    _log_failure("shutdown", RuntimeError(
+                        f"{len(alive) - posted} of {len(alive)} workers could not "
+                        "be told to stop — the queue stayed full"))
+                    ok = False
+                    break
+                time.sleep(0.005)
+                continue
+            posted += 1
         for t in alive:
             t.join(timeout)
-        _workers.clear()
+        _workers[:] = [t for t in _workers if t.is_alive()]
+        if _workers:
+            ok = False
     with _state_lock:
         _pending.clear()
         _running.clear()
+        _stats["cancelled"] += discarded
+    return ok

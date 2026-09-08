@@ -485,15 +485,14 @@ def test_the_cli_does_not_keep_its_own_copy_of_the_cross_file_total():
 
 
 def test_yellow_is_the_paired_count_and_never_a_row_tag():
-    """⚠️ A `mod` TAG WOULD MAKE `revert_change` DELETE THE MODIFIED LINES.
+    """⚠️ A `mod` TAG WOULD MAKE EVERY REVERT AND EVERY PATCH REFUSE.
 
     "Yellow = modifications" is tempting to implement as a fifth row tag. It must
-    not be, and the reason is not aesthetic: `diffview.revert_change` rebuilds the
-    pre-change file as `[t for tag, t in ch.lines if tag in ("del", "ctx")]` and
-    WRITES IT TO DISK, so a `mod` row would be excluded from the before-side and
-    reverting would silently drop every modified line from the user's file.
-    `to_patch` would also stop emitting appliable patches, since a `mod` row has no
-    unified-diff sigil.
+    not be, and the reason is not aesthetic: `diffs.hunks_of` reads exactly these
+    four tags to rebuild each hunk's two sides, and returns `None` — refuse — on any
+    other, so `revert_change` would stop being able to undo a modified line at all.
+    `to_patch` would likewise stop emitting appliable patches, since a `mod` row has
+    no unified-diff sigil.
     """
     assert diffs.TAGS == ("hunk", "add", "del", "ctx")
     for ch in (_create(20), _modify((25,)), _modify((5, 30)),
@@ -504,12 +503,12 @@ def test_yellow_is_the_paired_count_and_never_a_row_tag():
         assert ch.modified == min(ch.added, ch.removed)
 
 
-def test_a_revert_still_reconstructs_the_before_side_from_del_and_ctx_alone(tmp_path):
+def test_a_revert_round_trips_a_modified_line(tmp_path):
     """The round-trip the tag set is load-bearing for.
 
     Sabotage recipe for the test above: add a `mod` tag to `TAGS` and emit it for
-    paired rows, and this test is what turns red — with the file on disk missing
-    exactly the lines that were modified.
+    paired rows, and this test is what turns red — `hunks_of` no longer recognises
+    the rows, so the undo refuses and the file keeps the change.
     """
     from agent2.cli import diffview
     f = tmp_path / "a.py"
@@ -523,6 +522,155 @@ def test_a_revert_still_reconstructs_the_before_side_from_del_and_ctx_alone(tmp_
 
     assert diffview.revert_change(ch) is True
     assert f.read_text(encoding="utf-8") == original
+
+
+# ── Undo: the windowed before-side is not the file ─────────────────────────────
+
+def test_an_undo_restores_a_large_file_that_never_fitted_in_its_own_diff(tmp_path):
+    """⚠️ THE BUG THIS PAIR OF FUNCTIONS EXISTS FOR — 200 lines in, 7 lines out.
+
+    `revert_change` used to rebuild the pre-change file as
+    `[t for tag, t in ch.lines if tag in ("del", "ctx")]`. Those rows are an `n=3`
+    unified diff, so that expression is the whole file only when the file happened
+    to fit inside its own hunks. On a 200-line file with ONE changed line it wrote
+    7 lines to disk and returned True: 193 lines destroyed, reported as success.
+
+    ⚠️ `ch.truncated` cannot be the guard, and this test asserts that too. That flag
+    means "past MAX_DIFF_LINES *rendered* rows" and is False here — every ordinary
+    elided diff is partial without being truncated, which is exactly why the old
+    refusal looked like it covered this and did not.
+    """
+    from agent2.cli import diffview
+    f = tmp_path / "big.py"
+    original = "".join(f"line {i}\n" for i in range(1, 201))
+    f.write_text(original, encoding="utf-8")
+
+    after = original.replace("line 100\n", "CHANGED\n")
+    ch = compute_change(str(f), original, after)
+    assert ch.truncated is False                    # the old guard never fires here
+    assert len(ch.lines) < 20                       # ... and the rows are a WINDOW
+    f.write_text(after, encoding="utf-8")           # the tool runs
+
+    assert diffview.revert_change(ch) is True
+    assert f.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda t: t.replace("CHANGED\n", "HAND EDITED\n"),    # edited inside the hunk
+    lambda t: t.replace("line 28\n", ""),                 # a context line dropped
+    lambda t: "",                                         # emptied entirely
+])
+def test_an_undo_refuses_when_the_file_no_longer_matches_the_after_side(tmp_path, mutate):
+    """⚠️ AN UNDO AGAINST A FILE WE NO LONGER RECOGNISE IS A SECOND CORRUPTION.
+
+    The hunk's after-side is what the file is supposed to look like right now. A
+    mismatch means it moved on — an `[E]` round trip in the viewer, another turn's
+    write, a hand edit — so the undo refuses ENTIRELY rather than reverting the
+    hunks it still recognises. `revert_text` computes on a local list and returns
+    None, so nothing is written: the refusal is atomic by construction.
+    """
+    from agent2.cli import diffview
+    f = tmp_path / "moved.py"
+    original = "".join(f"line {i}\n" for i in range(1, 61))
+    after = original.replace("line 30\n", "CHANGED\n")
+    ch = compute_change(str(f), original, after)
+
+    moved = mutate(after)
+    f.write_text(moved, encoding="utf-8")
+    assert diffview.revert_change(ch) is False
+    assert f.read_text(encoding="utf-8") == moved    # untouched
+
+
+def test_an_undo_is_surgical_and_leaves_untouched_regions_alone(tmp_path):
+    """The whole point of reverse-applying rather than rebuilding.
+
+    A later append the diff never saw is not part of this change, so undoing the
+    change must not undo it. The old rebuild could not express that — it wrote the
+    hunks and nothing else, so every line outside them was lost whether or not
+    anybody had touched it.
+    """
+    from agent2.cli import diffview
+    f = tmp_path / "grown.py"
+    original = "".join(f"line {i}\n" for i in range(1, 61))
+    after = original.replace("line 30\n", "CHANGED\n")
+    ch = compute_change(str(f), original, after)
+    f.write_text(after + "appended later\n", encoding="utf-8")
+
+    assert diffview.revert_change(ch) is True
+    assert f.read_text(encoding="utf-8") == original + "appended later\n"
+
+
+def test_an_undo_puts_a_deleted_file_back(tmp_path):
+    """A whole-file delete is the one hunk whose header names an insertion POINT.
+
+    difflib writes `@@ -1,5 +0,0 @@` for it, so `new_start` is 0 rather than a
+    1-based line and `revert_text` must index with it directly. Off by one here and
+    the restore either refuses or lands the content one line late.
+    """
+    from agent2.cli import diffview
+    f = tmp_path / "gone.py"
+    original = "line 1\nline 2\nline 3\nline 4\nline 5\n"
+    f.write_text(original, encoding="utf-8")
+    ch = compute_change(str(f), original, None)
+    assert ch.kind == "delete"
+    f.unlink()                                      # the tool runs
+
+    assert diffview.revert_change(ch) is True
+    assert f.read_text(encoding="utf-8") == original
+
+
+def test_hunks_of_refuses_rather_than_returning_an_empty_plan():
+    """⚠️ `None` MEANS REFUSE, AND NEVER "NOTHING TO DO" — the consumer writes.
+
+    A `hunks_of` that returned `[]` for rows it could not read would make
+    `revert_text` return the file unchanged, which `revert_change` would then write
+    back and report as a successful undo. Every unreadable shape is `None`.
+    """
+    unreadable = [
+        FileChange(path="a.py", lines=[]),                              # no hunks
+        FileChange(path="a.py", lines=[("ctx", "x")]),                  # row before @@
+        FileChange(path="a.py", lines=[("hunk", "@@ nonsense @@")]),    # bad header
+        FileChange(path="a.py", lines=[("hunk", "@@ -1 +1 @@"),
+                                       ("mod", "x")]),                 # unknown tag
+    ]
+    for ch in unreadable:
+        assert diffs.hunks_of(ch) is None
+        assert diffs.revert_text(ch, "x\n") is None
+
+
+def test_an_undo_keeps_the_file_s_own_trailing_newline_convention(tmp_path):
+    """`lineterm=""` over `splitlines` cannot represent a trailing newline.
+
+    So the undo follows the file in hand rather than inventing one. Writing
+    `"\\n".join(rows) + "\\n"` unconditionally — which is what the old rebuild did —
+    appends a newline to a file that never had one, and that shows up as a spurious
+    one-line diff on the NEXT change to it.
+    """
+    from agent2.cli import diffview
+    f = tmp_path / "nonl.py"
+    original = "alpha\nbeta\ngamma"                 # no trailing newline
+    f.write_text(original, encoding="utf-8", newline="")
+    after = original.replace("beta", "BETA")
+    ch = compute_change(str(f), original, after)
+    f.write_text(after, encoding="utf-8", newline="")
+
+    assert diffview.revert_change(ch) is True
+    assert f.read_text(encoding="utf-8") == original
+
+
+def test_the_engine_owns_the_undo_computation_and_the_renderer_only_writes():
+    """One declaration: the reverse-apply is in `core/diffs.py`, not in a renderer.
+
+    `cli/diffview.revert_change` is the disk actor — read, call, write. A second
+    reconstruction living in the viewer is how the first one got there.
+    """
+    from agent2.cli import diffview
+    body = inspect.getsource(diffview.revert_change)
+    assert "revert_text(" in body
+    # The exact expression that shipped the data loss, in either surface's spelling.
+    assert 'tag in ("del", "ctx")' not in body
+    assert "splitlines" not in body
+    assert hasattr(diffs, "revert_text") and hasattr(diffs, "hunks_of")
 
 
 # ── Turn scope: whose changes is the recap reporting? ──────────────────────────

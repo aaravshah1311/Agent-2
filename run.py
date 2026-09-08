@@ -63,9 +63,19 @@ APP_DUAL  = ROOT / "agent2dual.py"
 # ── Self-update / bootstrap source ─────────────────────────────────────────────
 REPO_URL  = "https://github.com/aaravshah1311/Agent-2"
 # Files/dirs that must SURVIVE an update (never wiped, never overwritten).
+# ⚠️ `.env.env.migrated` is the LEGACY name and is listed on purpose: this
+# installer no longer creates it, but a build shipped `_migrate_env_once()`
+# renaming through `with_suffix(".env.migrated")`, which appends rather than
+# replaces on a dotfile, so installs in the wild hold the user's legacy
+# GEMINI_API_KEY under that name. `self_update()`'s prune step deletes any
+# top-level item this set does not name — so leaving it out is silent credential
+# loss on a machine that ran the old launcher. Honest limitation: the prune runs
+# in the OLD process with the OLD set, so this protects an install that picked
+# the fix up by `git pull` or a fresh `install.py`, not one whose very first
+# `--update` carries it.
 PRESERVE  = {
     "agent2.db", "agent2.db-wal", "agent2.db-shm", "agent2.db-journal",
-    ".env", ".env.migrated",
+    ".env", ".env.migrated", ".env.env.migrated",
 }
 
 OS_NAME = platform.system()   # Windows | Darwin | Linux
@@ -610,7 +620,21 @@ def _ensure_keys_table():
 
 
 def _migrate_env_once():
-    """Import any legacy .env GEMINI_API_KEY* into the DB, then retire the file."""
+    """Import any legacy .env GEMINI_API_KEY* into the DB, then retire the file.
+
+    ⚠️ **`with_name`, NEVER `with_suffix` — `.env` IS ALL SUFFIX AND HAS NO STEM.**
+    `Path('.env').suffix` is `''` and `.stem` is `'.env'`, so
+    `with_suffix('.env.migrated')` APPENDS and yields `.env.env.migrated`. That
+    shipped, and the failure was silent in the one direction that costs a user
+    something: `PRESERVE` names `.env.migrated`, `self_update()`'s prune step
+    deletes every top-level item `PRESERVE` does not name, and the retired file
+    still holds the key the user typed in — so the backup of their credential was
+    removed by the next `--update`, reported only as a count of "stale item(s)".
+    The state also latches: after the rename `.env` is gone, so this function
+    returns at its existence guard forever and never gets a second chance to name
+    the file correctly. The same trap was fixed once in `uninstall()`; this is the
+    writer, which is the copy that decides what is actually on disk.
+    """
     if not ENV_FILE.exists():
         return
     try:
@@ -623,7 +647,7 @@ def _migrate_env_once():
                     found.append(v.strip().strip('"').strip("'"))
         for k in found:
             _db_add_key(k)
-        ENV_FILE.rename(ENV_FILE.with_suffix(".env.migrated"))
+        ENV_FILE.rename(ENV_FILE.with_name(".env.migrated"))
         if found:
             print(f"  {g('[OK]')}  Migrated {len(found)} key(s) from .env into agent2.db")
     except Exception:
@@ -850,8 +874,23 @@ def uninstall():
         print(f"\n  {g('[OK]')}  Uninstall aborted.")
         return
 
-    # Files to wipe
-    to_delete = [VENV, ENV_FILE, ENV_FILE.with_suffix(".env.migrated"), DB_FILE]
+    # Files to wipe. ⚠️ BOTH retired-.env names are spelled out, and the pair is
+    # the point. `ENV_FILE.with_suffix(".env.migrated")` looks like the obvious way
+    # to name the sibling and yields `.env.env.migrated`, because `.env` is all
+    # suffix and has no stem for `with_suffix` to replace — and BOTH this list and
+    # `_migrate_env_once()` were written that way, so the two bugs cancelled and
+    # uninstall deleted the right file by accident. Correcting only this half broke
+    # that symmetry: it named a file the writer never created while leaving the one
+    # it did. So the writer now produces `.env.migrated` (the name `PRESERVE` has
+    # always claimed to protect) and the legacy spelling stays here, because an
+    # install that ran the old launcher still has the user's legacy key under it and
+    # "remove everything Agent2 put here" has to mean it. The WAL and SHM sidecars
+    # are listed for the same reason: deleting `agent2.db` alone leaves SQLite's
+    # journal behind for the next install to find.
+    to_delete = [VENV, ENV_FILE, ROOT / ".env.migrated",
+                 ROOT / ".env.env.migrated", DB_FILE,
+                 *(DB_FILE.with_name(DB_FILE.name + s)
+                   for s in ("-wal", "-shm", "-journal"))]
 
     for path in to_delete:
         if path.exists():
@@ -1146,7 +1185,7 @@ def self_update():
             return
 
         # Drop the cloned .git — we don't want to convert the user's install
-        # into a checkout of the upstream repo.
+        # into a checkout of the Agent-2 repo.
         clone_git = snapshot / ".git"
         if clone_git.exists():
             _rm_path(clone_git)

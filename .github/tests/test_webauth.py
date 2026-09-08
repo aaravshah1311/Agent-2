@@ -26,7 +26,9 @@ guard that breaks local development is a guard that gets turned off:
 """
 
 import os
+import socket
 import time
+from types import SimpleNamespace
 
 import pytest
 from flask import Flask
@@ -382,6 +384,276 @@ def test_a_safe_method_is_not_origin_checked(client):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Host — DNS rebinding, the attack Origin-vs-Host cannot see
+#
+# `_allowed_origins()` is built from `Host`, and `Host` is the client's. That is
+# fine against an ordinary hostile page (the browser puts the real target in
+# `Host`, so it disagrees with `Origin`) and useless against rebinding, where the
+# attacker owns the name on both sides. The socket half uses `_Req`, the same fake
+# the socket-gate section below uses.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rebound(**extra):
+    """The exact header set a DNS-rebound page produces, measured in a live app.
+
+    The attacker serves a page from `evil.example` on a short TTL, then re-points
+    that name at 127.0.0.1. The browser believes its own fetches are same-origin,
+    so it volunteers `Sec-Fetch-Site: same-origin` and an `Origin` that matches the
+    `Host` — and the connection really does come from loopback.
+    """
+    h = {"Host": "evil.example", "Origin": "http://evil.example",
+         "Sec-Fetch-Site": "same-origin"}
+    h.update(extra)
+    return h
+
+
+def test_a_rebound_dns_name_cannot_write_through_the_api(client):
+    """⚠️ Measured before the fix: this returned 200 and the row was written.
+
+    Every earlier check passed on its own terms — `Origin` matched `Host`,
+    `Sec-Fetch-Site` said same-origin, and loopback trust applied in `auto` mode.
+    The allowlist was the attacker's to write, so visiting a page was enough.
+    """
+    resp = client.post("/api/memories", json={"content": "rebind-probe"},
+                       headers=_rebound())
+    assert resp.status_code == 403
+    assert resp.get_json()["code"] == "bad_host"
+    assert db.qall("SELECT * FROM memories WHERE content='rebind-probe'") == []
+
+
+def test_a_rebound_dns_name_cannot_read_either(client):
+    """⚠️ Safe methods too — `origin_ok()` deliberately skips them, and that is
+    right for cross-*site* reads because the browser hides the body. A rebound
+    origin is same-origin, so the body comes back: one GET is the whole transcript.
+    """
+    resp = client.get("/api/chats", headers=_rebound())
+    assert resp.status_code == 403
+    assert resp.get_json()["code"] == "bad_host"
+
+
+def test_a_rebound_name_is_not_even_shown_the_login_page(client):
+    """⚠️ Which is why the check sits ABOVE `PUBLIC_PATHS`.
+
+    A login form served under a name the attacker controls is a phishing page in
+    this server's clothes, and the public paths are exactly the ones reached with
+    no credential at all.
+    """
+    root = client.get("/", headers={"Host": "evil.example",
+                                    "Accept": "text/html"})
+    assert root.status_code == 403
+    assert root.mimetype == "application/json"
+    assert b"<html" not in root.data.lower()
+    assert client.get("/api/auth/status",
+                      headers={"Host": "evil.example"}).status_code == 403
+    assert client.get("/style.css",
+                      headers={"Host": "evil.example"}).status_code == 403
+
+
+def test_a_rebound_dns_name_cannot_open_a_socket():
+    """⚠️ Measured before the fix: `True`. This is the `run_raw_command` door.
+
+    The handshake never reaches `before_request`, so the HTTP fix alone would have
+    left the one event that executes arbitrary shell commands reachable from a page
+    visit — every `/api/*` route locked and the shell open.
+    """
+    assert auth.socket_allowed(
+        _Req(addr="127.0.0.1", host="evil.example",
+             headers={"Origin": "http://evil.example"})) is False
+
+
+def test_an_ip_literal_host_is_always_allowed(client):
+    """⚠️ The asymmetry the whole fix rests on: an address has nothing to rebind.
+
+    So loopback, the LAN address the startup banner prints, a container IP, a
+    Tailscale IP and an IPv6 literal all keep working untouched — only an unknown
+    DNS *name* is refused. Without this the fix would be exactly the "unnecessary
+    security restriction that breaks legitimate functionality" it must not be.
+    """
+    for host in ("127.0.0.1:1311", "192.168.1.50:1311", "10.8.0.3",
+                 "[::1]:1311", "[fd7a:115c:a1e0::1]"):
+        assert auth.host_ok(SimpleNamespace(host=host)) is True, host
+    assert client.get("/api/chats",
+                      headers={"Host": "192.168.1.50:1311"}).status_code == 200
+
+
+def test_the_machine_answers_to_its_own_name(client):
+    """`http://<hostname>:1311` from another machine on the LAN is a supported way
+    in, so the configured hostname and its first label are both accepted."""
+    host = socket.gethostname().lower()
+    assert auth.host_ok(SimpleNamespace(host=host)) is True
+    assert auth.host_ok(SimpleNamespace(host=host.split(".", 1)[0])) is True
+    assert client.get("/api/chats", headers={"Host": host}).status_code == 200
+
+
+def test_a_proxy_name_is_admitted_by_the_variable_that_already_names_it(client):
+    """⚠️ ONE variable configures both checks.
+
+    `AGENT2_WEB_ORIGINS` already exists for the reverse-proxy case; asking an
+    operator to name their proxy in a *second* place is how one of the two ends up
+    unset, and the refusal text names this variable for the same reason.
+    """
+    os.environ["AGENT2_WEB_ORIGINS"] = "https://agent.example:8443"
+    assert auth.host_ok(SimpleNamespace(host="agent.example:8443")) is True
+    assert auth.host_ok(SimpleNamespace(host="agent.example")) is True
+    assert client.post("/api/memories", json={"content": "via-proxy"},
+                       headers={"Host": "agent.example:8443",
+                                "Origin": "https://agent.example:8443"}
+                       ).status_code == 200
+    assert auth.host_ok(SimpleNamespace(host="other.example")) is False
+
+
+def test_an_absent_host_is_allowed_because_there_is_no_name_to_rebind():
+    """HTTP/1.0 and hand-rolled clients omit it; no browser does."""
+    assert auth.host_ok(SimpleNamespace(host="")) is True
+    assert auth.host_ok(SimpleNamespace()) is True
+
+
+def test_off_mode_still_means_off(client):
+    """⚠️ `off` is an explicit, announced downgrade for a deployment that already
+    has auth in front of it — a proxy terminating an arbitrary hostname is exactly
+    that deployment, so the host check may not survive the switch."""
+    os.environ["AGENT2_WEB_AUTH"] = "off"
+    assert client.post("/api/memories", json={"content": "off-mode"},
+                       headers=_rebound()).status_code == 200
+    assert auth.socket_allowed(_Req(host="evil.example")) is True
+
+
+def test_own_names_never_performs_a_reverse_lookup():
+    """⚠️ `socket.getfqdn()` can block for the resolver's whole timeout.
+
+    `gethostname()` only reads the configured name. A hostname allowlist that can
+    hang is one that hangs every request on a box with a sick resolver — and this
+    is asked on the path of every single request, including the socket handshake.
+
+    ⚠️ Asserted on the parsed CALLS, not on the source text: this module's own
+    docstrings name `getfqdn` in order to say it is not used, so a text sweep would
+    fail on the very comment that documents the rule.
+    """
+    import ast
+    import inspect
+    banned = {"getfqdn", "gethostbyname", "gethostbyaddr", "getaddrinfo",
+              "gethostbyname_ex", "create_connection"}
+    called = {n.func.attr
+              for n in ast.walk(ast.parse(inspect.getsource(auth)))
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not (called & banned), f"resolver call on the request path: {called & banned}"
+    assert "gethostname" in called, "the allowlist has to come from somewhere"
+
+
+def test_the_host_check_is_asked_before_anything_is_served():
+    """Pins the ORDER, which is the half a reader can get wrong.
+
+    Below `PUBLIC_PATHS` the check still refuses the API and still hands a rebound
+    page the login form; below the identity steps it would refuse nothing that
+    loopback trust had already allowed.
+
+    ⚠️ Line numbers off the AST, not `str.index`: `decide()`'s docstring explains
+    the ordering in prose, so a text search finds the explanation before the code.
+    """
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(auth.decide))
+    first = {}
+    for node in ast.walk(tree):
+        name = (node.attr if isinstance(node, ast.Attribute) else
+                node.id if isinstance(node, ast.Name) else None)
+        if name and name not in first:
+            first[name] = node.lineno
+    for later in ("PUBLIC_PATHS", "LOOPBACK_PATHS", "origin_ok", "SESSION_COOKIE",
+                  "_authorized"):
+        assert first["host_ok"] < first[later], f"host_ok must precede {later}"
+    # ⚠️ A CALL, not a text search: `socket_allowed`'s own docstring names
+    # `host_ok()` in prose, so `"host_ok" in getsource(...)` stays true with the
+    # call deleted — sabotage proved exactly that, which is this repo's
+    # tautology-trap class over again.
+    handshake = ast.parse(inspect.getsource(auth.socket_allowed))
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "host_ok" for n in ast.walk(handshake)), \
+        "the handshake never reaches before_request — it must ask for itself"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Non-ASCII credentials — a gate that answers 500 has stopped deciding
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_a_non_ascii_bearer_token_is_refused_not_a_500(client):
+    """⚠️ Measured before the fix: HTTP 500, from a `TypeError` out of the guard.
+
+    `hmac.compare_digest` raises on a non-ASCII `str`, Werkzeug latin-1-decodes
+    headers (so byte 0xFF arrives as `'ÿ'`), and `decide()` has no outer `try` — so
+    the refusal became a crash. A 500 from an authorization gate is not a refusal:
+    it is the gate declining to answer, and every later reader of that response has
+    to guess which it was.
+    """
+    resp = _remote(client, "get", "/api/chats",
+                   headers={"Authorization": "Bearer \xff\xfe-not-a-token"})
+    assert resp.status_code == 401
+    assert resp.get_json()["code"] == "bad_token"
+
+
+def test_a_non_ascii_csrf_header_is_refused_not_a_500(client):
+    """The second request-fed comparison, reached with a live cookie session."""
+    os.environ["AGENT2_WEB_TOKEN"] = "tok-abc-123"
+    client.post("/api/auth/login", json={"token": "tok-abc-123"})
+    resp = _remote(client, "post", "/api/memories", json={"content": "x"},
+                   headers={auth.CSRF_HEADER: "\xff\xfe"})
+    assert resp.status_code == 403
+    assert resp.get_json()["code"] in ("csrf", "bad_origin")
+
+
+def test_a_non_ascii_token_in_the_query_string_is_refused_not_a_500(client):
+    """`?token=` is the third door into the same comparison.
+
+    ⚠️ The escape has to be **valid UTF-8** (`%C3%BF` = `ÿ`). Werkzeug leaves a
+    malformed one (`%FF`) as the literal seven ASCII characters `%FF%FE`, which
+    never reaches `compare_digest` as a non-ASCII `str` at all — so a test written
+    that way passes against the defect it was meant to pin.
+    """
+    resp = _remote(client, "get", "/api/chats?token=%C3%BF%C3%BE")
+    assert resp.status_code == 401
+    assert resp.get_json()["code"] == "bad_token"
+
+
+def test_the_socket_gate_survives_a_non_ascii_credential():
+    """It already failed closed via its blanket `except` — but "closed by crash"
+    and "closed by decision" are different facts, and only one of them keeps
+    working when a later reader narrows that `except`."""
+    assert auth.socket_allowed(
+        _Req(headers={"Authorization": "Bearer \xff\xfe"})) is False
+
+
+def test_the_credential_encoding_is_injective_not_merely_total(client):
+    """⚠️ `surrogatepass`, never `replace`.
+
+    `replace` maps every unencodable character onto ONE replacement byte, so two
+    *different* candidates would encode identically and compare equal — a
+    comparison hardened against timing and silently weakened against content. This
+    is the assertion that stops the obvious "fix" for the TypeError.
+    """
+    assert auth._cmp_bytes("\udcff") != auth._cmp_bytes("\udcfe")
+    assert auth._cmp_bytes("\xff") != auth._cmp_bytes("\xfe")
+    assert auth._cmp_bytes("tok") == auth._cmp_bytes("tok")
+
+    os.environ["AGENT2_WEB_TOKEN"] = "\xff-real-token"
+    assert auth.token_matches("\xff-real-token") is True
+    assert auth.token_matches("\xfe-real-token") is False
+
+
+def test_a_non_ascii_token_is_usable_rather_than_rejected_out_of_hand(client):
+    """⚠️ Encoded, not refused-if-non-ASCII.
+
+    `AGENT2_WEB_TOKEN` is an operator's own string, and `os.environ` on POSIX can
+    hand back undecodable bytes as surrogates. Refusing non-ASCII outright would
+    lock such an operator out of their own server — a correctness bug wearing a
+    security fix's clothes.
+    """
+    os.environ["AGENT2_WEB_TOKEN"] = "clé-privée-\xff"
+    resp = _remote(client, "get", "/api/chats",
+                   headers={"Authorization": "Bearer clé-privée-\xff"})
+    assert resp.status_code == 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Sessions — expiry, rotation, logout
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -515,12 +787,12 @@ def test_rate_limit_zero_disables_it(client):
 class _Req:
     """The two attributes and one mapping `socket_allowed` actually reads."""
 
-    def __init__(self, addr=REMOTE, headers=None, cookies=None):
+    def __init__(self, addr=REMOTE, headers=None, cookies=None, host="localhost"):
         self.remote_addr = addr
         self.headers = headers or {}
         self.cookies = cookies or {}
         self.args = {}
-        self.host = "localhost"
+        self.host = host
 
 
 def test_a_remote_handshake_without_a_credential_is_refused():

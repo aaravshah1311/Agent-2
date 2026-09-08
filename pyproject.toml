@@ -129,6 +129,16 @@ known-first-party = ["agent2"]
 # plain `("text", line)` span, i.e. the unhighlighted line, which is exactly what
 # a terminal without colour support shows anyway.
 "agent2/core/highlight.py" = ["BLE001", "S110"]        # → line rendered unhighlighted
+# Measurement, and nothing else. Every entry point is on the hot path of something
+# that matters — a tool call, an output line, a queue pickup — and NOTHING reads a
+# metric to make a decision. So a failure degrades to "that observation is missing"
+# and is itself counted in `report()["meta"]["dropped"]`, which is the one place a
+# reader would look. ⚠️ The direction is what makes this safe: losing the exception
+# cannot hide a fault the user must act on, because the operation being measured
+# reports its own success independently — while raising would make the diagnostic
+# the outage, which is the failure mode Task 27's "avoid excessive runtime
+# overhead" is really about. `AGENT2_METRICS=0` removes it entirely.
+"agent2/core/metrics.py" = ["BLE001", "S110"]          # → observation dropped and counted
 # The stage trail / task queue / activity feed. Progress is presentation and is
 # on NO path a result depends on, so a raising emit (a dropped socket, a browser
 # that closed mid-turn) degrades to "no progress shown" — a turn that failed
@@ -143,7 +153,47 @@ known-first-party = ["agent2"]
 # recovery hint must never do. NOT exempt where it matters: `adopt()`,
 # `set_status()` and `save_checkpoint()` are unguarded, so a recovery that cannot
 # be persisted fails loudly instead of pretending it was adopted.
-"agent2/core/recovery.py" = ["BLE001", "S110"]         # → no recovery offered, state intact
+#
+# ⚠️ FOUR ENTRIES, NOT A `recovery/*.py` GLOB, AND NOT THE OLD `recovery.py`.
+# Task 25 turned the module into a package, and the single stale path silently
+# un-exempted all four files at once — which is the good failure (65 lint errors),
+# but the reason each file is named individually is the bad one: a glob would hand
+# the exemption to every module a later phase drops into this package without
+# anybody stating what that module degrades TO. The bar at the top of this table
+# applies per file, so the list is per file.
+"agent2/core/recovery/__init__.py" = ["BLE001", "S110"]  # → no recovery offered, state intact
+# Task 25 §3/§6. The classifier answers "what kind of work was this, and did it
+# land". Every swallow degrades toward LESS confidence, never more: an unreadable
+# row, a legacy non-JSON `detail`, a path that cannot be stat'ed and a broken
+# `verify_step` all fold into `V_UNCERTAIN` / `R_UNKNOWN`, and both of those route
+# the item to the human review queue rather than to a retry. That direction is the
+# whole file — a raise here would abort the scan and leave the remaining
+# interrupted rows with nobody left to look at them, which is strictly worse than
+# one over-cautious review entry.
+"agent2/core/recovery/classify.py" = ["BLE001", "S110"]  # → uncertain, never a confident retry
+# Task 25 §2/§4/§5. The scan runs at STARTUP, before the CLI prompt and before the
+# web server binds, so its failure budget is the strictest in this table: it may
+# never be the reason the app does not start. Each swallow has a defined fallback
+# and every one of them stops short of acting — a row that cannot be assessed is
+# left `interrupted` (so the NEXT launch sees it again, unchanged), a decision that
+# cannot be written leaves the ledger row untouched, and a counter that cannot be
+# bumped costs a number in `/api/health`. Nothing is hidden: `_oops()` records the
+# failure in `_counters["errors"]`, which is the ONE counter `stats()` reports as a
+# health problem, and the interrupted rows are still there to be found.
+# NOT exempt where it matters: `permitted()` in safety.py fails CLOSED, and
+# `_finish()`'s call into `execstate.resolve_interrupted()` is a compare-and-swap —
+# a swallowed failure there means the row stays interrupted, never that it is
+# reported settled.
+"agent2/core/recovery/crash.py" = ["BLE001", "S110"]     # → row stays interrupted, app starts
+# Task 26 §1. A pure classification table: "may this operation be repeated?" The
+# three swallows are `_norm_tool`, `_segments`/`_kind_of_argv` (a pathological or
+# non-string command line) and `permitted`. The first two degrade to `UNKNOWN` /
+# `SHELL`, which the disposition table maps to `D_VERIFY` — the strict end — and
+# the third fails CLOSED (`False`), so a permission layer that cannot answer
+# refuses. ⚠️ That asymmetry is the module's whole design: being wrong here in the
+# lenient direction is a second `delete_file` or a duplicate `git push`, so there
+# is no lenient direction to swallow into.
+"agent2/core/recovery/safety.py" = ["BLE001", "S110"]    # → strictest kind, permission denied
 # Process plumbing (Task 5). Two distinct swallows, both with a defined fallback:
 #   * a reader thread that dies (decode error, pipe torn down under it) posts its
 #     EOF mark in `finally` and ends quietly — otherwise `drain` would wait for a
@@ -200,6 +250,257 @@ known-first-party = ["agent2"]
 # branch, the broker emits no Git block). Losing the exception hides nothing the
 # user must act on: they can run `git status` themselves and see the real error.
 "agent2/core/gitstate.py" = ["BLE001", "S110"]         # → empty snapshot, never a raise
+# Task 29. `/init` DESCRIBES a project; it never repairs one, and it may not fail
+# because one file in a tree of twenty thousand was unreadable. Each analysis step
+# runs inside its own guard (`_step`) — one per step, never one around the
+# sequence, the rule `core/broker/__init__.py` carries — so a malformed
+# `package.json` costs the caller the JavaScript half of the answer and nothing
+# else. ⚠️ The degradation is NOT silent, which is what makes this safe: every
+# swallow appends to `report()["errors"]` with the step that failed, both surfaces
+# print those lines, and `truncated`/`truncated_by` say when a ceiling engaged.
+# That matters more here than in a renderer, because Task 31 writes this scan into
+# `.agent2/agent2.md` and every later turn reads it as fact — so "no tests found"
+# and "I never got as far as looking" must not print the same way.
+"agent2/core/projectscan.py" = ["BLE001", "S110"]      # → step absent + recorded in `errors`
+# Tasks 30–31, the WRITE half of `/init`. It has two degradations and they point in
+# opposite directions on purpose. (1) The model call that writes `## Purpose`,
+# `## Features` and `## Architecture` is entirely optional — no key, no network, a
+# refusal or an unparseable reply each fall back to evidence-only prose, because the
+# offline install is the one this project is built for; the result carries
+# `describe_note` and both surfaces print it, so "a model wrote this" and "nothing
+# was reachable" never read the same. (2) The permission check FAILS CLOSED: a
+# broken `core.permissions` import returns without writing, since the helper being
+# consulted is the one that says whether writing is allowed at all. Everything
+# after the merge — `gitstate.invalidate()`, the audit line — is bookkeeping that
+# may not cost a user the file that was already written correctly.
+"agent2/core/projectdoc.py" = ["BLE001", "S110"]       # → generated prose degrades; the write does not
+# Phase 11, Tasks 32–36. FOUR ENTRIES, NOT A GLOB, for the reason `core/recovery/`
+# is four: each module degrades to a *different* thing, and one line per file is
+# what forces the next module in the package to state its own answer rather than
+# inherit somebody else's. What they share is the premise — a skill is an ADDITION
+# to the prompt, so every degradation here lands on "the prompt of Phase 10", which
+# is a working prompt. A subsystem whose whole purpose is to add optional text may
+# never be the reason a turn fails.
+#   * discovery walks a tree the USER owns — an unreadable file, a symlink loop, a
+#     directory that vanished mid-walk. It degrades per entry and records the file
+#     in `Catalog.errors` / `skipped`, so a skipped skill is visible on both
+#     surfaces rather than absent; `truncated_by` names the ceiling that engaged.
+"agent2/core/skills/discovery.py" = ["BLE001", "S110"]  # → that skill absent + named in `errors`
+#   * normalize reads frontmatter a THIRD PARTY wrote (Claude / Codex / Antigravity)
+#     and may not be the thing that decides a foreign file is fatal. A header it
+#     cannot parse degrades to the raw body plus an `unparsed` count — the skill
+#     still reaches the prompt, minus the metadata nobody could read.
+"agent2/core/skills/normalize.py" = ["BLE001", "S110"]  # → raw body + `unparsed` count
+#   * select is the turn path. Every failure is an empty `Selection`, which is the
+#     prompt without a `## PROJECT SKILLS` block — and `for_turn()` catches around
+#     it as well, so the degradation is stated twice on purpose.
+"agent2/core/skills/select.py" = ["BLE001", "S110"]     # → empty selection, prompt intact
+#   * state is the only writer, and it fails in the SAFE direction: an unreadable
+#     `skill_state` row reads as "never chosen", i.e. automatic. The opposite
+#     default would let a locked database silently disable every skill in the
+#     project, which is the failure `AGENT2_CONTEXT_ISOLATION`'s `''` default and
+#     `AGENT2_RESUME`'s fallback are both shaped against.
+"agent2/core/skills/state.py" = ["BLE001", "S110"]      # → "never chosen" (automatic), never "off"
+# ── The generalized DAG core (Phase D1): a graph may never cost a turn ────────
+# TWO exemptions for the whole package, and both are held by the modules that touch
+# the world — the store (D1) and the scheduler (D2). ⚠️ The split is the same one
+# `graph.py` / `runner.py` draw below: the two modules that only *compute* are
+# deliberately absent, so an exemption can never spread by proximity.
+#   * `store.py` is where the engine touches the world — the task rows, the run
+#     ledger, the permission gate, the sync bus, the clock. Every consumer reaches
+#     it from a turn (`workflow.for_turn()` today, a scheduler and UltraCode next),
+#     so its degradations are the ones that decide whether a broken graph costs a
+#     plan or costs the session. All of them are stated, and all point the same way:
+#     `create()` refuses by RETURNING a `GraphRun(ok=False, reason=…)` — never an
+#     exception, because both its callers are printing surfaces; `load()` degrades to
+#     an empty `GraphState`, which reads as *no such run* and never as *every node is
+#     done* (`finished` is False on an empty state by construction, so a locked
+#     database cannot make a plan look complete and a resume cannot skip real work);
+#     `claim()` and `mark()` fail CLOSED, so a row nobody could claim is a node that
+#     does not run twice; and `stats()` swallows so a counter can never be why a
+#     `/health` read fails. The one swallow that could hide a fault — the breadcrumb
+#     write in `advance()` — is bookkeeping whose truth `load()` re-derives from the
+#     task rows on every read, and `execstate._fail()` already announces a broken
+#     ledger once per process.
+"agent2/core/dag/store.py" = ["BLE001", "S110"]          # → refusal with a reason, or an empty state
+#   * `schedule.py` (Phase D2) runs OTHER PEOPLE'S CODE. A worker is a consumer's
+#     callable — a tool, a model call, an MCP session, a subprocess — and *whatever*
+#     it raises has to become that node's error rather than the caller's traceback,
+#     which is precisely one blind catch at one site (`_work`). The rest point the
+#     same way and each has a stated fallback: `plan_next()`/`limits()` degrade to the
+#     declared defaults (a ceiling that cannot be read is never read as *unlimited*),
+#     `may_repeat()` fails **CLOSED** so a classifier fault refuses a retry rather
+#     than granting a blind one, `dispatch()` reads a failed claim as `claimed` — the
+#     loser of a race must never be the second runner of a node — `Ctx.beat()` /
+#     `progress()` are liveness bookkeeping that may not end a node that is working,
+#     `_emit()` costs one listener's event, and `stats()` swallows so a counter can
+#     never be why a `/health` read fails. The `S110` pair is the queue `put` in
+#     `_work` and the `_emit` guard: a verdict that cannot be posted is reaped by the
+#     pump's own reload, and the alternative — a worker thread dying inside its
+#     reporting path — is a node that runs forever with nobody watching.
+"agent2/core/dag/schedule.py" = ["BLE001", "S110"]        # → one FAILED node, never a raised turn
+# ⚠️ `model.py` AND `validate.py` ARE DELIBERATELY ABSENT, for the reason spelled out
+# under `workflow/graph.py` below — they are pure computation over data a caller hands
+# in, with no I/O, no clock and no subprocess, so there is nothing in either that can
+# legitimately fail in a way worth swallowing. `make_graph()` coerces junk rather than
+# raising on it and `validate()` reports rather than declining to answer. An exemption
+# in `validate.py` specifically would let a bug in the cycle finder pass as graceful
+# degradation — and a cycle finder that silently finds nothing is indistinguishable
+# from a graph that has no cycles, which is the one failure that turns into a
+# permanent, silent deadlock rather than an error.
+# ── Workflow (Task 37): a run is a convenience, never a hostage ──────────────
+# A workflow adds *task rows that already existed* and a context block. The bar is
+# the skills bar for the same reason: a subsystem whose whole purpose is to add
+# optional structure may never be why a turn fails, and here the stakes are higher
+# in one direction — a run's rows are DURABLE, so a half-written run is a plan a
+# human has to clean up by hand.
+#   * runner was both a writer and a turn-path reader; since Phase D1 the writing is
+#     `core/dag/store.py`'s (above) and this file is the **projection**, so what is
+#     left to exempt is `stats()`' swallow — a counter may never be why a `/health`
+#     read fails. The two guarantees it inherits are unchanged and still stated here
+#     because both surfaces depend on them: `instantiate()` refuses by RETURNING a
+#     reason (a caller-visible refusal, never an exception), and the read path
+#     degrades to an empty `RunState` — which reads as "no such run", never as "every
+#     node is done": `finished` is False on an empty state by construction, so a
+#     broken ledger cannot make a workflow look complete.
+"agent2/core/workflow/runner.py" = ["BLE001", "S110"]   # → empty state, never "done"
+#   * the facade is the broker's renderer. Every failure is `active: False`, i.e.
+#     the prompt without a `## WORKFLOW IN PROGRESS` block — and `broker.collect()`
+#     guards around it as well, so the degradation is stated twice on purpose,
+#     exactly as `skills.for_turn()`'s is.
+"agent2/core/workflow/__init__.py" = ["BLE001", "S110"]  # → no workflow block, turn intact
+# ── Workflow FILES (Task 38): one bad file costs one workflow ─────────────────
+#   * the loader reads a folder that belongs to the USER — hand-written YAML, half
+#     saved by an editor, a symlink into another checkout, a file whose permissions
+#     changed. `skills/discovery.py`'s rule applies unchanged: the guards sit around
+#     **I/O and the per-file build**, one per file, never one around the walk, so an
+#     unreadable `audit.yaml` costs that workflow and every other one still loads.
+#     A refused file is not silent — it comes back as a `WorkflowFile` whose `ok` is
+#     False with an `L_UNREADABLE` / `L_OUTSIDE` / `L_TRUNCATED` problem both
+#     surfaces print, and the two cache/hook swallows degrade to TTL-only expiry.
+#   ⚠️ `_Parser` NEEDS NO EXEMPTION AND HAS NO CATCH — it is `graph.py`'s case: pure
+#     computation over lines, every loop body either consumes one or breaks, and a
+#     shape outside `SUBSET` is *counted* in `unparsed` rather than raised on. The
+#     only parse that can fail is `json.loads`, caught at one named site and reported
+#     as `L_PARSE` with the stdlib's own line number, which is a better answer than a
+#     subset reader's shrug.
+"agent2/core/workflow/loader.py" = ["BLE001", "S110"]   # → one workflow absent and named, never a broken list
+# ── Writing a workflow file (Task 39): a refusal is a RETURN VALUE ────────────
+#   * `authoring.py` is the one writer, and both its callers are printing surfaces
+#     (`/workflow`, `POST /api/workflows/<name>`), so `projectdoc.apply()`'s contract
+#     applies verbatim: every failure — a denied capability, a read-only folder, a
+#     full disk, a name that resolves outside the project — comes back as
+#     `Authored(ok=False, reason=…)` that the surface prints, never as a traceback
+#     into a REPL or a 500.
+#   ⚠️ Two swallows here fail **closed**, which is why losing the exception is safe:
+#     `_allowed()` returns False when the permission layer itself cannot answer, and
+#     `_contained()` returns False when a path cannot be resolved — a name Agent2
+#     cannot prove is inside the workflows folder is refused, exactly as
+#     `workspace/__init__.py` treats an unresolvable path as outside.
+#   ⚠️ The `S110` pair is the temp-file cleanup in `_write()`. It must not mask the
+#     real fault: the write's own error is already captured in `exc` and returned, so
+#     the swallow costs at most one stray `.tmp` beside a file whose failure was
+#     reported — the alternative is a cleanup error replacing the reason the write
+#     failed, which is the one line the user needs.
+"agent2/core/workflow/authoring.py" = ["BLE001", "S110"]  # → refusal with a reason, never a raise
+# ── Verification (Phase D3): the failure direction is the whole design ────────
+#   * `core/verify.py` reads two durable ledgers and a checkpoint column and says
+#     whether a completion claim survives them. Every reachable input is somebody
+#     else's persisted text — a `detail` column written by an older build, a
+#     `checkpoint` blob from a schema this build predates, an `exit_code` that is a
+#     string — and the module is called from `/workflow`, from a route and from a
+#     turn, so a raise here would turn "I could not read one row" into a dead surface.
+#   ⚠️ AND LOSING THE EXCEPTION HIDES NOTHING, BECAUSE THE FALLBACK IS THE ACCUSING
+#     ONE. Each guard degrades to *less evidence*, and less evidence can only move a
+#     verdict from `confirmed` toward `unconfirmed` — never the reverse. `_verdict()`
+#     needs at least one piece of read evidence to say `confirmed` at all, so an
+#     unreadable row cannot manufacture agreement; the worst a swallowed exception
+#     costs is a line a human reads, which is precisely the direction the spec's
+#     *"'Done' is not verification"* asks us to fail in.
+#   ⚠️ The one swallow that is not a read is `_record()`'s: an audit write may never
+#     be why a verdict fails to reach the caller — `logging.py`'s own rule.
+"agent2/core/verify.py" = ["BLE001", "S110"]             # → less evidence ⇒ unconfirmed, never confirmed
+# ── Dynamic planning (Phase D4): every degradation makes LESS work, not more ───
+#   * `core/workflow/dynamic.py` turns a sentence a user typed into a graph, so its
+#     three foreign dependencies are exactly the three that cannot be trusted to
+#     answer: an off-turn **model call** (no key, no network, a refusal, junk JSON),
+#     the **broker** (ten sources, git subprocesses, a project doc read) and the
+#     **classifier** (somebody else's persisted task row, possibly from an older
+#     schema). It is called from `/workflow auto`, from `POST /api/workflows/auto`
+#     and from `replan()` on a live run — three printing surfaces — so `projectdoc`'s
+#     contract applies verbatim: a refusal is a `Draft(ok=False, reason=…)`.
+#   ⚠️ AND LOSING THE EXCEPTION CANNOT INVENT WORK, WHICH IS THE ONLY DIRECTION THAT
+#     MATTERS HERE. `_context_for()` degrades to a thinner prompt, `_ask()` to a
+#     one-step goal-derived plan with the reason NAMED in `note` (`projectdoc`'s four
+#     degradations, for its reason), and `_classify()` fails **closed** — a classifier
+#     that cannot answer DECLINES the node (`X_RESUMABLE`) rather than inventing
+#     remediation for it, so a swallowed exception can only ever produce fewer nodes.
+#     A blind retry is what the spec forbids; a blind *catch* here is what prevents it.
+#   ⚠️ `_steps_from` / `_acyclic` / `_norm_id` NEED NO EXEMPTION AND HAVE NO CATCH —
+#     `graph.py`'s rule: pure computation over a dict the caller already holds, which
+#     coerces junk rather than raising on it, so an exemption there would let a bug in
+#     the cycle filter pass as graceful degradation.
+"agent2/core/workflow/dynamic.py" = ["BLE001", "S110"]   # → fewer nodes, never a raise and never more work
+# ⚠️ `graph.py` IS DELIBERATELY ABSENT FROM THIS LIST. It is pure computation over
+# data a caller hands in, so it needs no blind catch to be total: `make_def()`
+# coerces junk rather than raising on it and `validate()` reports rather than
+# refusing to answer. An exemption there would let a real bug in the cycle finder
+# — the one check a silent failure turns into a permanent deadlock — pass as
+# "graceful degradation".
+# ── UltraCode (Phase D5): a thinner brief, never a bolder run ──────────────────
+#   * `core/ultracode/plan.py` gathers the evidence a human is shown before approving
+#     autonomous execution, and every one of its sources is one this process does not
+#     control: a bounded project **walk** (a locked file, an undecodable manifest, a
+#     `git` binary missing from PATH), the project **doc** (a path that resolves
+#     outside the workspace, a read-only checkout) and the **skills** pass (somebody
+#     else's markdown in somebody else's repository). `brief()` is called from
+#     `engine.start()` and its result is printed by `/ultracode` and by
+#     `POST /api/ultracode`, so `projectdoc.apply()`'s contract applies verbatim:
+#     a source that cannot answer costs one line of the brief and never the run.
+#   ⚠️ ONE GUARD PER SOURCE, never one around the three — `broker.collect()`'s rule,
+#     and here it is load-bearing in a way an outer `try` would destroy: the git step
+#     is the one most likely to degrade, and a single catch would take the *proved
+#     test command* down with it, which is the one field a `check` node is built from.
+#   ⚠️ AND LOSING THE EXCEPTION CANNOT MAKE THE RUN BOLDER, WHICH IS THE ONLY
+#     DIRECTION THAT MATTERS. Every degradation subtracts evidence, and less evidence
+#     can only make the graph *more* conservative: no proved command means the check
+#     node runs **nothing** and says so (never an invented `npm test` that exits 0 and
+#     reads as verification), no doc means a note telling the operator to `/init`, no
+#     skills means a plan with fewer instructions. The `S110` pair is the `tests`
+#     mapping coercion, whose two fields are counts a surface prints — `test_command`
+#     is read separately below it, so a malformed `tests` block cannot fabricate a
+#     runner for a project that has none.
+#   ⚠️ `engine.py` IS HERE FOR THE MIRROR REASON: it is the driver, so its foreign
+#     dependencies are the planner's off-turn **model call**, the **scheduler**, the
+#     **verifier** and the **classifier**, and it is reached from a REPL, from a route
+#     and from its own bounded loop. Every guard degrades to *stopping* — a refusal
+#     carrying a reason, a cycle that ends, a verdict that reads `unconfirmed` — and
+#     never to a node dispatched anyway, so a swallowed exception here can only ever
+#     produce less autonomy than was asked for.
+#   ⚠️ `stages.py` IS DELIBERATELY ABSENT, `graph.py`'s rule verbatim: `stage_of()`,
+#     `rank()` and `awaiting_approval()` are pure reads over a `GraphState` the caller
+#     already holds, they contain no catch, and `stage_of()` is total by construction
+#     (any junk reads as `planning`). An exemption there would let a bug in the stage
+#     derivation — a run reporting `executing` while every node is settled — pass as
+#     graceful degradation. Same for `plan.graph_for()`, which coerces rather than raises.
+"agent2/core/ultracode/plan.py" = ["BLE001", "S110"]     # → one field of the brief, never the run
+"agent2/core/ultracode/engine.py" = ["BLE001", "S110"]   # → the loop stops with a reason, never a blind dispatch
+# ⚠️ execstate IS BOOKKEEPING FOR THE NEXT PROCESS, and it may never cost this one a
+# command. It is written from `commands._mutate` (which is reached once per output
+# LINE via `heartbeat`) and from `tools.dispatch_tool` (every tool call), so a full
+# disk, a locked DB, an unreadable path or a legacy non-JSON `detail` row must all
+# degrade to "no recovery hint" rather than into a turn. The degradation is visible:
+# `_fail()` logs the first swallow of each process through `alog.exec_persist_failed`,
+# so a permanently broken ledger is announced exactly once instead of once per line.
+"agent2/core/execstate.py" = ["BLE001", "S110"]        # → no recovery hint, turn intact
+# Task 24/25 added two swallows to the task store, and only these two — the rest of
+# the module still raises, because a task that cannot be persisted must fail loudly.
+#   * `stale_running()` coerces its `older_than` argument and falls back to the
+#     documented 90 s default rather than raising at a caller that passed a string;
+#   * `heartbeat()` returns False when the write fails, which makes a live task read
+#     as STALE — the strict direction, and the one that ends in a review entry
+#     instead of a task nobody ever revisits.
+"agent2/core/tasks.py" = ["BLE001"]                    # → default staleness / heartbeat missed
 
 # ── Agent loops: one bad part/tool/emit must not kill the conversation ───────
 # NOT exempt from the real rule: a key-level error (quota/auth) is re-raised to

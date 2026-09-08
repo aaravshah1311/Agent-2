@@ -242,10 +242,38 @@ _ROUTE_RULES: tuple[tuple[str, str, str], ...] = (
     # models are called with.
     ("/api/models", "", CAP_SETTINGS),
     ("/api/sync", "", CAP_READ),
+    # Recovery, both halves (Task 3's session resume and Phase 8's crash records).
+    # ⚠️ `chat` is deliberate and it is NOT the whole gate. This table sees a method
+    # and a path, never the body — and `POST /api/recovery/units/<kind>/<id>` carries
+    # `acknowledge` (clearing a review queue: no execution at all), `retry` and
+    # `terminate` (privileged) through the SAME path. Rating the path for its worst
+    # action would make clearing a queue require `exec`; rating it for its safest is
+    # only sound because the two risky actions ask `permissions` again themselves,
+    # live, inside `crash.retry()` / `crash.terminate()`. That is the same split
+    # `run_raw_command` uses: a surface capability here, the real one at the act.
     ("/api/recovery", "", CAP_CHAT),
     ("/api/chats", "", CAP_CHAT),
+    # `/init` (Tasks 29–31). ⚠️ `fs.write`, NOT `settings`: the request creates
+    # `.agent2/agent2.md` inside the workspace, so it is a file write like any
+    # other and `AGENT2_DENY_CAPS=fs.write` must stop it on both surfaces at once.
+    # `projectdoc.apply()` asks again, live, for the same capability — the same
+    # surface-then-act split `/api/recovery/units` uses, and the reason a dry run
+    # (`write: false`) still answers.
+    ("/api/project", "", CAP_FS_WRITE),
     ("/api/skills", "", CAP_SETTINGS),
     ("/api/workflows", "", CAP_CHAT),
+    # UltraCode (Phase D5) — the same `chat` rating as the workflows it plans, and
+    # for the reason `/api/recovery/units` is rated for its safest action: this table
+    # sees a method and a path, never the body, and `POST /api/ultracode` carries
+    # `start`, `approve` and `cancel` through one path. What an UltraCode node
+    # eventually *does* is gated where it is done — `dispatch_tool` asks for
+    # `fs.write` / `fs.delete`, `stream_command` for `exec` — so rating the door for
+    # its worst possible node would demand `exec` merely to read a stage back, while
+    # rating it for the door itself is exact: an operator may drive the agent.
+    # ⚠️ It is a row rather than an omission because the unmatched-unsafe default is
+    # `destructive`: correct for a route nobody thought about, wrong for a verb an
+    # `operator` is meant to have.
+    ("/api/ultracode", "", CAP_CHAT),
     ("/api/metrics", "", CAP_READ),
 )
 
@@ -301,6 +329,7 @@ _TOOL_CAPS: dict[str, str] = {
     "save_memory": CAP_MEMORY,
     "convert_file": CAP_FS_WRITE,
     "run_file_op": CAP_FS_WRITE,
+    "update_project_doc": CAP_FS_WRITE,
 }
 
 

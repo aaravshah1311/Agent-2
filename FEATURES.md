@@ -10,10 +10,11 @@ The full inventory of **Agent-2**, a self-hosted autonomous AI agent powered
 by Google Gemini. It covers **what exists**, **what is tested**, and **what is
 deliberately not built** — with counted numbers, not marketing.
 
-> **One line:** an autonomous agent — 17 tools, offline personalization,
-> universal file processing, Burp and ZAP over MCP, a capability model and sealed
-> credentials — that runs as a CLI, a web app or both at once over a single
-> SQLite file, backed by **1 602 tests**.
+> **One line:** an autonomous agent — 18 tools, one generalized DAG behind
+> workflows and an autonomous loop, offline personalization, universal file
+> processing, Burp and ZAP over MCP, a capability model and sealed credentials —
+> that runs as a CLI, a web app or both at once over a single SQLite file, backed
+> by **2 670 tests**.
 
 Every figure below was read out of the code. Where an older document and the code
 disagreed, the code won. Where something is designed and not implemented, it says
@@ -26,17 +27,26 @@ so — see [What is *not* implemented](#-what-is-not-implemented).
 | | Counted |
 |---|---|
 | Surfaces over one brain | **3** — CLI *(default)*, Web UI, Dual |
-| Agent tools | **17** — 12 core + 5 File Intelligence |
+| Agent tools | **18** — 13 core + 5 File Intelligence |
 | Gemini models | **6** in **3** modes, plus any OpenAI/Anthropic-compatible endpoint |
-| Slash commands | **29**, plus 5 keybindings |
-| HTTP endpoints | **67** |
-| Socket.IO events | **29** server→client, **10** client→server |
-| SQLite tables | **22**, across **18** migrations |
-| Environment variables | **61** |
-| Named audit event kinds | **14** |
-| File Intelligence | **11** registered plugins · **69** formats · **331** format/operation pairs |
-| Tests | **1 602** across **37** test modules, many sabotage-verified |
+| Slash commands | **36**, plus **9** keybindings |
+| HTTP endpoints | **81** in `server/routes.py`, plus **4** in `server/auth.py` |
+| Socket.IO events | **25** server→client, **8** client→server, plus **2** lifecycle |
+| SQLite tables | **27**, across **32** migrations |
+| Environment variables | **116** |
+| Named audit event kinds | **35** — **31** from the named helpers, **4** written directly |
+| File Intelligence | **11** registered plugins (7 modules) · **71** formats detected, **69** with operations · **331** format/operation pairs · **26** operations |
+| Graph execution | **1** DAG engine · **9** node states · **4** consumers (Workflow, Workflow files, Dynamic Workflow, UltraCode) |
+| Tests | **2 670** across **51** test modules, many sabotage-verified |
 | Telemetry | **0 bytes**. No account, no upload, no phone-home |
+
+⚠️ **Endpoints are METHOD+path pairs, not decorators** — one `@app.route` carrying
+`methods=["GET", "POST"]` is two endpoints. ⚠️ **Slash commands are the length of
+`cli/render.SLASH_COMMANDS`**, never a grep for `/[a-z]+` (that counts aliases like
+`/colour` and `/config`); keybindings are the length of `cli/statusbar.SHORTCUTS`,
+never a grep for `Ctrl+` (that misses Esc, Tab and F1). ⚠️ **71 and 69 are both
+right** — 71 is what the detector *recognises*, 69 is what the capability registry
+holds operations for, so two formats are identified and have nothing to run.
 
 ---
 
@@ -112,9 +122,9 @@ explicit.
 
 ---
 
-## 🛠 The 17 agent tools
+## 🛠 The 18 agent tools
 
-**Core (12)**
+**Core (13)**
 
 | Tool | What it does |
 |---|---|
@@ -127,6 +137,7 @@ explicit.
 | `web_search` | DuckDuckGo — no API key required |
 | `update_todo` · `emit_plan` | Publish and update a live task list |
 | `save_memory` | Persist a durable fact |
+| `update_project_doc` | Re-scan the project and refresh `.agent2/agent2.md` — the same `scan()` + `projectdoc.apply()` `/init` calls, with `describe` defaulting to **False** so a factual refresh costs no model call |
 
 **File Intelligence (5)** — `detect_file`, `file_capabilities`, `run_file_op`,
 `convert_file`, `search_workspace`. Router-dispatched shims into
@@ -134,7 +145,9 @@ explicit.
 
 | Invariant | The bug it prevents |
 |---|---|
+| A tool exists only if **four** lists agree — `agent._LOCAL_TOOLS`, `tools.REGISTRY` + `tools._build_tools()`, `cli/tooling._SHARED_TOOLS` + `_build_tools()`, and `llm.providers.agent_tool_schema()` | Each omission is a *different* silent failure: missing from `_LOCAL_TOOLS` ⇒ "not registered" mid-turn; missing from a `_build_tools()` ⇒ the model is never told the tool exists on that surface; missing from `agent_tool_schema()` ⇒ every custom provider can dispatch it and none is advertised it. **Two of those shipped** — the CLI schema declared none of the five File Intelligence tools, and the provider schema omitted `emit_plan`. The guard that let them through was per-name; the invariant is that the name **sets** agree, now pinned in both directions |
 | `run_command` is the **only** tool that bypasses `dispatch_tool` | So `terminal.stream_command` and `cli/runtime.run_cmd_stream` each carry their own exec gate. The CLI's sits **outside** the retry loop — a refusal must not be able to change on retry |
+| `update_project_doc` is a **tool**, not a hook inside `write_file` | A hidden refresh at the file-write chokepoint would be a whole project walk per file written, a fifth call site across four agent loops, and a write the user can see in neither the transcript nor the diff viewer |
 | The capability gate returns a tool **`error`**, never an exception | The model reads errors and adapts. An exception ends the turn instead |
 | MCP tool ownership is **membership**, not prefix | `registry.resolve()` asks each bridge whether it actually holds the name, so a disconnected ZAP stops claiming `zap_*` instead of swallowing the call as "not registered" |
 | `sanitize_name()` **force-prefixes** every MCP tool | It is the only reason the two agent loops may check `_LOCAL_TOOLS` in opposite orders. Drop the prefix and an MCP tool can shadow a local one on one surface and not the other |
@@ -606,19 +619,409 @@ construction → announced plaintext.
 
 ---
 
+## 🕸 One generalized DAG
+
+`core/dag/` is the **single** graph engine. Three modules with one job each:
+`model.py` says what a graph, a node and an edge *are*, `validate.py` says whether one
+can ever finish, `store.py` turns one into rows and reads it back. `schedule.py` is the
+one scheduler over it.
+
+| | |
+|---|---|
+| **Consumers** | **4** — Workflow, workflow *files*, Dynamic Workflow, UltraCode. Every one of them is a consumer, **never** an engine |
+| **Node states** | **9** — `pending` · `ready` · `running` · `completed` · `failed` · `blocked` · `paused` · `cancelled` · `skipped` |
+| **Storage** | **No new table and no migration.** A graph is one `exec_workflows` row plus N `agent_tasks` rows, node id on `CP_NODE` and run id on `CP_WORKFLOW` |
+| **Entry points** | `create()` · `plan()` (writes nothing) · `extend()` (the one mutation path) · `load()` · `advance()` |
+
+> ⚠️ **Feature-agnosticism is a test here, not a promise.** Four `ast`-based structural
+> tests assert that no `if workflow:` / `if ultracode:` / `if security:` / `if zap:` /
+> `if skill:` — and no feature name at all — appears in the package. The domain half is
+> **injected** (`validate(…, knob=…, label=…)`), so a 4-node workflow is refused with
+> the workflow feature's own sentence, word for word, by an engine that has never heard
+> of workflows.
+
+> ⚠️ **Six of the nine states are read straight off `agent_tasks.status`; READY and
+> BLOCKED are derived on every read.** Storing readiness would let a crash leave a node
+> claiming READY behind an upstream that never finished — and deriving is *cheaper*:
+> `load()` is one `qone` + one `qall` for a graph of any size.
+
+> ⚠️ **A cycle is the one error that produces no error.** `tasks.ready()` releases a
+> node when its dependencies are *settled*, so a ring of three simply never becomes
+> ready: `ready()` returns `[]` forever, the run sits at 0/3, nothing raises and nothing
+> is logged. `find_cycles()` is iterative rather than recursive, because a 500-node
+> chain must be **reported**, never turned into a `RecursionError`.
+
+> ⚠️ **A mutation may not rewrite the past.** `validate_mutation()` refuses to drop a
+> settled node, to rewire one, or to grow past `AGENT2_DAG_MAX_MUTATIONS` — *completed
+> work stays completed; only remaining execution changes*, made checkable.
+
+### The scheduler
+
+*Never blindly run every READY node* is the whole of `schedule.py`'s job.
+`plan_next()` is pure and writes nothing (it is what the CLI shows a human); `run()` is
+the bounded pump.
+
+- **Every declined node carries a reason.** `HOLD_CODES` says why *one* node waited;
+  `REASONS` says how a whole *run* ended; `EVENTS` is a third vocabulary. No word is
+  shared between them, and `taken | held == offered` is asserted — a planner cannot
+  drop a node without saying so.
+- **It derives no readiness of its own.** `tasks.ready()` is still the only predicate,
+  and `schedule.py` calling neither `ready()` nor `blockers()` is an `ast` assertion.
+- The corollary: `ready()` releases a node whose upstream **failed**, so declining it
+  (`H_UPSTREAM`) and marking it SKIPPED is the scheduler's job — otherwise a run holds
+  itself open forever on a branch that can never be work.
+- **Five ceilings, two shapes.** `max_workers` / `max_running` bound a run;
+  `kind_limits` bounds one *kind* at a time (commands, MCP calls); `kind_budgets`
+  bounds what a run may **spend** on a kind over its whole life (model calls). A
+  consumer that invents a node kind bounds it by adding a row.
+- **Retries are bounded *and* classified.** `may_repeat()` asks `recovery.classify`
+  first, so a node whose failure is not repeatable becomes a FAILED row carrying *why*
+  rather than a row parked for a pump that has stopped counting.
+
+> ⚠️ **In-flight is derived from the rows, never counted in memory.** Dual mode is two
+> processes over one `agent2.db`, so a counter hands each of them a full allowance and
+> the ceiling silently doubles. Same reason a **budget** is charged from
+> `attempt_count`: a retry really is a second call, and a crash-resumed run gets no
+> fresh allowance.
+
+> ⚠️ **`AGENT2_DAG_MAX_WORKERS=0` is a supported answer, not a broken one** — nodes run
+> inline on the calling thread, one at a time. It is `AGENT2_MAX_CONCURRENT_TURNS=0`'s
+> posture, node-shaped.
+
+> ⚠️ **`core/scheduler.py` is untouched and must stay so.** That pool bounds *turns*,
+> whose queue outlives any graph; this one bounds the nodes of a single run and dies
+> with it.
+
+---
+
+## 🗂 Workflows
+
+A multi-step plan expressed as a task graph — and **not a second execution engine**.
+Every node is an `agent_tasks` row and every run is one `exec_workflows` row, so the
+checkpoints, the heartbeat, `/recovery` and the crash scan a workflow gets are the ones
+that already existed. It needed **no migration**.
+
+| | |
+|---|---|
+| **Files** | `.agent2/workflows/*.yaml` (or `.json`), next to the skills a user already keeps there |
+| **CLI** | `/workflow` · `list` · `new` · `edit` · `run` · `auto` · `delete` · `show` · `state` · `reload` |
+| **HTTP** | `GET/POST /api/workflows` · `GET/DELETE /api/workflows/<name>` · `POST /api/workflows/<name>/run` · `POST /api/workflows/auto` |
+| **Ceilings** | `WORKFLOW_MAX_NODES = 64` · `WORKFLOW_STATE_CHARS = 1200` · `MAX_FILES = 64` · `MAX_BYTES = 131072` · `BUDGET_SEC = 2.0` |
+
+- **Bare `/workflow` executes nothing.** `run` is the one verb that starts anything,
+  and it Validates → Builds the DAG → **shows the plan** → then runs.
+- **The filename is the name.** A disagreeing `name:` line is *reported* and the
+  filename wins, because two files may claim one name and then `/workflow run x` has no
+  answer.
+- **PyYAML is not a dependency**, so the readable subset is *declared* (`SUBSET`) and
+  anything outside it — an anchor, a tag, a flow mapping — lands in `notes` as
+  unsupported, counted, never approximated.
+- **An older schema still runs.** `UPGRADES` holds one step per version and `upgrade()`
+  walks the ladder; the result carries `upgraded_from` plus a warning, so a human can
+  see their file was read as something slightly different from what they wrote.
+
+> ⚠️ **Progress is derived from the rows, never read out of the run.**
+> `exec_workflows.state` is a breadcrumb, recomputed on every read — so a killed run
+> reports what is true *now* rather than what was true when it died, and a resume never
+> re-runs a completed node.
+
+> ⚠️ **`WORKFLOW_MAX_NODES` refuses, never truncates.** A graph missing its last node is
+> a graph whose dependencies no longer close, and it would deadlock `tasks.ready()` in
+> silence. Same for a truncated *file*: the tail of a YAML document is where the last
+> node's `needs:` lives.
+
+> ⚠️ **The turn gets the current node, not the plan.** `for_turn()` inlines exactly one
+> instruction and *names* at most a few others — a worker gets only what it needs. And
+> it is **flat, not merely cheap**: a 24-node graph costs the same three queries as a
+> 3-node one, because a per-node read is invisible at the size a developer tests with
+> and 64 round trips per turn at the size a user writes.
+
+### Dynamic workflows — a goal sentence becomes a graph
+
+`/workflow auto <goal>` · `POST /api/workflows/auto`. The one module in the family whose
+input is somebody else's text, so most of it is boundary rather than feature.
+
+- **PLAN is the default and PLAN writes nothing at all** — no `exec_workflows` row, no
+  `agent_tasks` row. `auto` must be asked for **by name**, and an unrecognised mode word
+  is *refused* rather than coerced.
+- **The planner decides *what*; the DAG decides *structure*** — `ast`-asserted, as a
+  **call** ban on `levels_for` / `find_cycles` / `validate` / `plan_next` / `ready` /
+  `dispatchable` and the rest.
+- Its whole structural opinion is that every `needs` must point **backwards in
+  declaration order**, which buys three of the validator's problems at once and is what
+  licenses `DYNAMIC_MAX_STEPS` to **clip a suffix** instead of refusing the plan.
+- **Rounds are read off the row**, never counted in memory — dual mode is two processes
+  over one DB, so a counter hands each a full allowance.
+
+> ⚠️ **Two buttons in the browser, never one.** `Plan` writes nothing; `Start it`
+> appears **only after a plan has been drawn**. A panel that shipped one button would
+> create task rows for anybody who pressed Enter in a text field.
+
+---
+
+## 🤖 UltraCode — the adaptive loop
+
+UNDERSTAND → INSPECT → DISCOVER SKILLS → PLAN → EXECUTE → OBSERVE → ANALYZE → VERIFY →
+(pass ⇒ continue | fail ⇒ RE-PLAN → EXECUTE). The **fourth consumer** of the one DAG,
+not a fifth engine — so again **no new table and no migration**.
+
+| | |
+|---|---|
+| **Doors** | **Two, and only two** — `/ultracode` in the terminal and `POST /api/ultracode`. Asserted structurally, because this loop writes code |
+| **CLI verbs** | `start <goal>` · `run` · `approve` · `state` · `cancel` · `policy` |
+| **HTTP actions** | `start` · `approve` · `cancel` (`GET /api/ultracode` is the read half) |
+| **Node kinds** | **4** — `build` · `check` · `approval` · `fix`. The DAG *stores* a kind and never branches on it |
+| **Ceilings** | `ULTRACODE_MAX_CYCLES = 6` · `ULTRACODE_BUDGET_SEC = 0` (off) · approval **on** by default |
+
+- **Bare `/ultracode` executes nothing**, and an unknown first word is **refused, never
+  read as a goal**: `/ultracode fix the login bug` is indistinguishable from a verb this
+  build lacks, and guessing turns a typo into a planner call and a graph of task rows.
+- **Verification is a node.** A check that ran outside the graph could not hold work
+  back, so a downstream node would proceed while it was still pending — and it asks
+  `core/verify.py`, never a model, because a model grading its own output is the failure
+  the rule names.
+- **Approval is a node too** — created and immediately PAUSED, with the roots depending
+  on it. `tasks.pause()` writes no stop checkpoint, which is the only thing separating
+  *a human chose to hold this* from *a crash abandoned it*, so the hold survives a crash
+  and recovery can never helpfully undo it.
+- **Recovery happens first and unasked, and the released nodes are named** — a silent
+  release is indistinguishable from a node that was never stuck.
+- **Thirteen refusal words**, a fifth closed vocabulary sharing no string with the
+  scheduler's hold codes, its run reasons, the skills selector's, the planner's, the
+  classifier's or the verifier's.
+
+> ⚠️ **The stage is derived from the rows and never stored.**
+> `execstate.workflow_step()` *replaces* `exec_workflows.state` on every node
+> transition, so a stage written there would be gone by the next node. Deriving is also
+> what lets a run killed mid-flight report the stage that is true **now**, with no stale
+> copy for a resume to reconcile.
+
+> ⚠️ **"Cycles", deliberately not "rounds".** A cycle that fixes something *without*
+> asking a planner for new nodes spends a cycle and **no round at all** — twenty of
+> those sit far under every mutation ceiling while being exactly the runaway they exist
+> to stop.
+
+> ⚠️ **One clock, checked between cycles.** `ULTRACODE_BUDGET_SEC` is never handed to
+> the pump: the pump owns `AGENT2_DAG_NODE_TIMEOUT`, and two clocks over one node is two
+> answers. A long node overruns and is *reported* at the boundary rather than killed
+> mid-write.
+
+> ⚠️ **A successful `cancel` answers `ok: false`.** `ok` asks *did this run do its job*,
+> and a cancelled one did not — the cancel took effect when `reason` is `cancelled`.
+> Likewise `Finish.ok` is **not** `report.verified`: a run of pure reasoning nodes is
+> legitimately unverifiable and must still be allowed to finish.
+
+---
+
+## ✅ Verification — "Done" is not verification
+
+One question, for anything that runs: *something said it finished — does the durable
+record agree?* `agent_tasks.status` is written **by the thing being judged**, so a
+second opinion at a call site is not a second opinion, it is the same claim repeated.
+
+| Verdict | Means |
+|---|---|
+| `open` | Not settled. Nothing has been claimed yet |
+| `unsuccessful` | Settled, and says so |
+| `confirmed` | Claims success, and the record agrees |
+| `contradicted` | Claims success, and the record **disagrees** |
+| `unconfirmed` | Claims success, and nothing was recorded either way |
+
+Five checks, each off a different record: the claim itself, the checkpoint view,
+`exec_commands` exit codes, `exec_tool_calls` failures (and `post is null`, the crash
+signal), and the `pre`/`post` digest pairs inside those rows.
+
+- **It verifies a task row**, which is why it knows nothing about workflows — it imports
+  neither `core.dag` nor `core.workflow`. A workflow node, a dynamic-workflow node and
+  an UltraCode node are one shape here.
+- **Problems alone decide; warnings never do.** An *unconfirmed* unit is a warning:
+  promoting it would make a node whose whole job was to read and reason
+  indistinguishable from one that failed, and that false negative would fire on every
+  run.
+- **Two queries per report at any node count.** A per-node read is 128 round trips at
+  sixty-four nodes.
+
+> ⚠️ **Read-only, and it does not re-stat disk.** The question is *did it happen*, not
+> *is it still there*: a file a later step legitimately replaced would read as a
+> contradiction. The digests were recorded at the moment of the call; this compares what
+> was recorded and never takes a second reading.
+
+> ⚠️ **There is deliberately no off switch.** Verification off does not make Agent-2
+> quieter, it makes it **credulous** — every claim would read as confirmed. The only
+> knob is `AGENT2_VERIFY_MAX_ROWS`, a *read* ceiling, and when it engages the report
+> says `truncated`.
+
+---
+
+## 🎒 Skills
+
+Instruction files a user (or another agent's toolchain) leaves in `.agent2/skills/`,
+read on the turn path and selected **per request**. Four modules: `discovery.py` walks,
+`normalize.py` translates, `select.py` ranks, `state.py` remembers — feeding the
+broker's existing `skills` slot, so this added a collector *body*, not a source.
+
+| | |
+|---|---|
+| **Manifests read** | **10** — `SKILL.md`, `SKILL.yaml/yml`, `AGENTS.md`, `AGENT.md`, `GEMINI.md`, `ANTIGRAVITY.md`, `agent2.md`, `INSTRUCTIONS.md`, `PROMPT.md` |
+| **Selection tiers** | **5**, index *is* rank — **request** (the message names it) → **project** (`agent2.md` names it) → **enabled** → **relevant** (declared keywords match) → **general** (`always: true`) |
+| **Ceilings** | `SKILLS_MAX = 64` · `MAX_DEPTH = 6` · `MAX_BYTES = 65536` · `BUDGET_SEC = 2.0` · `IN_PROMPT = 4` · `MAX_CHARS = 6000` |
+| **Surfaces** | `/skills` (+ `list` · `on` · `off` · `reset` · `show` · `last` · `reload`) · `GET/PUT /api/skills` · the browser's Skills panel |
+
+- **Not every skill in every prompt** — that is the acceptance bar and the reason the
+  selector exists. Ten discovered skills and an unrelated message put *nothing* in the
+  prompt.
+- `priority` orders **within** a tier and may never promote past one: a pinned
+  house-style skill does not outrank the skill the user just asked for.
+- **Every omission carries a `why`** — `disabled` · `shadowed` · `cap` · `chars` ·
+  `empty`. A skill in the folder and absent from the prompt with no stated reason is
+  indistinguishable from a broken walk.
+- Parsing is **stdlib only**, so a header shape this reader cannot handle is *counted*
+  in `unparsed` rather than guessed at, and an unrecognised field is kept in `extra`
+  rather than dropped.
+
+> ⚠️ **No write API reaches this package.** Every `open()` in all four modules is
+> asserted to carry an explicit read-only mode, and `write_text` / `write_bytes` /
+> `mkdir` / `shutil` / `unlink` / `rename` are absent from the code — because a skill is
+> frequently somebody else's file in somebody else's repository. Enablement is therefore
+> a **database row**, scoped to this project.
+
+> ⚠️ **Three states, and the third is the point.** `None` (never chosen) still allows
+> automatic selection; `False` beats every signal *including the request naming it*.
+> So `/skills` is a **block list, not a force list**: ON means "not `False`", and
+> switching something back on restores *automatic* rather than pinning it into every
+> prompt.
+
+> ⚠️ **The vendor is a label, never a dispatch.** `origin` is reported and never
+> branched on — asserted as *no module outside `normalize.py` names a vendor*, which is
+> the difference between a normalization layer and a per-vendor plugin.
+
+---
+
+## 🩺 Health and 📈 Metrics
+
+Two surfaces, deliberately two commands: folding them into one would put a percentile
+next to a fault.
+
+| | Health | Metrics |
+|---|---|---|
+| **Route** | `GET /api/health` (`200` / `503`) | `GET /api/metrics` |
+| **CLI** | `/health` | `/metrics [reset]` |
+| **Shape** | **14** sections, **16** verdict rows | **13** declared signals |
+| **Scope** | Install-wide counters | **Per process**, and `scope` says so |
+
+Health's fourteen sections — Agent · Database · Connection Pool · WAL Checkpointer ·
+Scheduler · Task Queue · Command Executor · Sync Layer · Crash Recovery · MCP · Memory ·
+Context Broker · Model Providers · Permissions — are each a **projection** of the reader
+that already owns the fact, never a re-test.
+
+Metrics' thirteen signals: `llm.latency`, `llm.tokens`, `llm.errors`, `tool.latency`,
+`tool.failures`, `command.duration`, `queue.wait`, `task.duration`,
+`workflow.duration`, `memory.retrieval`, `context.size`, `mcp.latency`,
+`permission.denials`.
+
+> ⚠️ **16 rows from 14 sections is not drift.** `_rows()` expands `mcp` into one row per
+> registered server and `providers` into Gemini + Custom, *inside* the `SECTIONS` loop —
+> so there is still one declaration of which subsystems a health read covers, and a
+> renderer that hard-coded 14 would silently drop a server.
+
+> ⚠️ **`problems` alone decides `ok` and the 503; `warnings` may never influence
+> either.** Every supported configuration that trips the 503 spends the meaning of the
+> 503. And ⚠️ **`off` is not a lesser `warn`** — the WAL checkpointer, the scheduler and
+> both MCP bridges can be off *on purpose*, and a cross printed at a deliberate choice
+> is how an alert stops being read.
+
+> ⚠️ **Three of the thirteen signals are borrowed, not measured.** LLM latency and
+> errors belong to the router (durable and install-wide) and permission denials to
+> `core.permissions`; the report *forwards* them, and recording into one is a **counted
+> no-op** — the guard that stops a later phase adding a second, drifting copy.
+
+> ⚠️ **Cardinality is capped, per signal.** Past `MAX_SERIES` a new label folds into
+> `~other`; an unrecognised *name* is a different fact and gets `~unknown`. Labels are
+> created on first observation, so admitting model-supplied text would let junk names
+> fold the real tools into `~other` for the life of the process — a measurement
+> destroyed by what it measures.
+
+> ⚠️ **A series holds numbers and one enum-ish label — no content, ever.** Neither
+> payload carries key material, chat or memory text, command lines or paths.
+
+---
+
+## 🎛 The graph family's knobs
+
+Every ceiling above is an environment variable, and each one's *direction* is chosen
+rather than defaulted.
+
+| Var | Default | Effect |
+|---|---|---|
+| `AGENT2_DAG_MAX_NODES` | `512` | Nodes one graph may declare, any consumer. **Refused, never truncated**; a consumer's own ceiling is injected, not replaced |
+| `AGENT2_DAG_MAX_MUTATIONS` | `64` | Nodes a **live** graph may gain. `0` is supported — *plan once and never invent more work* |
+| `AGENT2_DAG_MAX_WORKERS` | `4` | Pump threads. `0` runs nodes inline, one at a time |
+| `AGENT2_DAG_MAX_RUNNING` | `8` | Nodes in flight, any kind. A **second** number from workers: in-flight is derived from the rows, so it counts another process's claims too |
+| `AGENT2_DAG_MAX_COMMANDS` | `2` | Shell nodes together. Small on purpose — eight racing for one terminal is how output becomes unreadable |
+| `AGENT2_DAG_MAX_MCP_CALLS` | `2` | Burp and ZAP are single instances behind one HTTP session each |
+| `AGENT2_DAG_MAX_MODEL_CALLS` | `200` | **Lifetime** spend of one run on model-backed nodes, charged from `attempt_count` |
+| `AGENT2_DAG_MAX_ATTEMPTS` | `2` | Times one node may be *started*. Bounded **and** classified |
+| `AGENT2_DAG_NODE_TIMEOUT` | `0` (off) | Ceiling on one node. Off by default — a node may legitimately be a 40-minute build |
+| `AGENT2_WORKFLOWS` | `1` | Master switch. `0` ⇒ no run may be instantiated and the context source collects nothing |
+| `AGENT2_WORKFLOW_MAX_NODES` | `64` | Nodes one workflow may declare (floor **2**) |
+| `AGENT2_WORKFLOW_STATE_CHARS` | `1200` | What the `workflow_state` block may spend. The other nodes are **named, never inlined** |
+| `AGENT2_WORKFLOW_MAX_FILES` | `64` | Files one discovery pass reads |
+| `AGENT2_WORKFLOW_MAX_BYTES` | `131072` | Bytes from **one** file. A truncated declaration is *refused* |
+| `AGENT2_WORKFLOW_BUDGET_SEC` | `2.0` | Wall-clock on one discovery pass |
+| `AGENT2_DYNAMIC_WORKFLOW` | `1` | Master switch for the **planner** only. It does not disable workflow *files* |
+| `AGENT2_DYNAMIC_MAX_STEPS` | `24` | Steps one generated plan may contain. **Clipped and reported**, the opposite of the file ceiling |
+| `AGENT2_DYNAMIC_MAX_ROUNDS` | `3` | Times one run may be re-planned. Read off the row, never counted in memory |
+| `AGENT2_ULTRACODE` | `1` | Master switch for the autonomous driver. It does not disable workflows or their planner |
+| `AGENT2_ULTRACODE_MAX_CYCLES` | `6` | Execute→verify→re-plan cycles. **Cycles, not rounds** |
+| `AGENT2_ULTRACODE_BUDGET_SEC` | `0` (off) | Wall-clock for one run. Checked *between* cycles and reported, never enforced mid-write |
+| `AGENT2_ULTRACODE_APPROVAL` | `1` | Whether a human must release the run. **On by default**, and the gate is a DAG node |
+| `AGENT2_VERIFY_MAX_ROWS` | `500` | Rows one verification read may consult, per ledger. **The only knob verification has** |
+| `AGENT2_SKILLS` | `1` | Master switch for `.agent2/skills/` |
+| `AGENT2_SKILLS_MAX` | `64` | Skills discovered before the walk stops (floor **4**) |
+| `AGENT2_SKILLS_MAX_DEPTH` | `6` | Levels below `.agent2/skills/` |
+| `AGENT2_SKILLS_MAX_BYTES` | `65536` | Bytes from one skill file. Half a skill beats a refusal nobody can see |
+| `AGENT2_SKILLS_BUDGET_SEC` | `2.0` | Wall-clock on one discovery pass |
+| `AGENT2_SKILLS_IN_PROMPT` | `4` | **Skills that may reach one prompt** — the number the bar is measured against |
+| `AGENT2_SKILLS_MAX_CHARS` | `6000` | Characters the whole skills block may spend |
+| `AGENT2_RESUME` | `off` | Whether a launch continues the last conversation **by itself**. `last` opts in |
+| `AGENT2_METRICS` | `1` | `0` makes every entry point a single boolean test |
+| `AGENT2_METRICS_SAMPLES` | `128` | Samples kept per series. A ring buffer — percentiles are computed at *read* time |
+| `AGENT2_METRICS_MAX_SERIES` | `64` | Labels a signal may have before folding. **Per signal**, so one chatty name cannot starve the other twelve |
+
+> ⚠️ **A master switch means *indistinguishable from never written*, not *quieter*.**
+> `AGENT2_SKILLS=0`, `AGENT2_WORKFLOWS=0`, `AGENT2_DYNAMIC_WORKFLOW=0`,
+> `AGENT2_ULTRACODE=0` and `AGENT2_METRICS=0` all meet that bar. There is deliberately
+> no `AGENT2_VERIFY=0`, for the reason stated above.
+
+> ⚠️ **`AGENT2_RESUME` defaults to `off`, and the reversal was deliberate.** This
+> shipped as `last`, and an unasked resume is not free: saving history DELETEs a chat's
+> rows and re-INSERTs the window, so the first turn of a session that continued *by
+> accident* rewrites a transcript the user never meant to open. `/load`, `--continue`,
+> `/resume` and the browser's `load` palette command are the four ways in.
+
+---
+
 ## 💾 Database
 
-**22 tables** across **18 migrations**, in one `agent2.db`. All state lives here —
+**27 tables** across **32 migrations**, in one `agent2.db`. All state lives here —
 never in a `.env`.
 
-`agent_tasks` · `api_keys` · `chats` · `file_ops` · `key_usage` · `mcp_config` ·
+`agent_tasks` · `api_keys` · `chats` · `exec_commands` · `exec_recovery` ·
+`exec_tool_calls` · `exec_workflows` · `file_ops` · `key_usage` · `mcp_config` ·
 `mcp_state` · `memories` · `messages` · `model_attempts` · `model_caps` ·
 `pil_ngrams` · `pil_phrases` · `pil_prefs` · `pil_vocab` · `providers` · `rules` ·
-`schema_migrations` · `settings` · `sync_state` · `task_sessions` · `web_sessions`.
+`schema_migrations` · `settings` · `skill_state` · `sync_state` · `task_sessions` ·
+`web_sessions`.
+
+⚠️ **Twenty-six of those are declared in `database.py` and one is not.** `providers`
+is created by `agent2/llm/providers.py` on first use, which is why migration 5
+exists — so the honest count is `database.py` **∪** `llm/providers.py`, and a count
+of one file alone is short by one and looks derived.
 
 | | |
 |---|---|
 | **One access layer** | `qall` / `qone` / `exe` / `exemany` / `batch()`. Nothing else may `import sqlite3` — that is the one place a query can be wrong |
+| **An index on an existing table needs BOTH halves** | The table's own DDL **and** a `_MIGRATIONS` step. ⚠️ `_create_table` returns early when the table is already there, so a DDL-only index reaches **fresh databases only** — and the install with a year of ledger rows is the one that needed it. The four exec ledgers were asymmetric this way until migrations 30–32 |
 | **Pooling** | `AGENT2_DB_POOL = 8` (floor 4), idle connections retired after `AGENT2_DB_POOL_IDLE = 300` s; `0` keeps every one warm |
 | **WAL** | Checkpointed every `AGENT2_WAL_CHECKPOINT_SEC = 60` s, skipping a `-wal` smaller than 2 MiB; `0` disables the thread |
 | **Relocatable** | `AGENT2_DB` moves the database (and, by default, the log folder with it) |
@@ -635,8 +1038,10 @@ All logs in **one folder** — `logs/`, next to the database, so a container wit
 - `a2web` → `logs/agent2-web.log` — the web console.
 - ⚠️ Never point the web logger at the `agent2` namespace: replacing that logger's
   handlers silently kills the audit file.
-- **14 named event kinds.** ⚠️ The helper you *call* and the string the log *holds*
-  are not spelled the same — grep for the right-hand column:
+- **31 named event kinds**, one helper each. ⚠️ The helper you *call* and the string
+  the log *holds* are not spelled the same — grep for the right-hand column. This
+  table is a **partial list**; the recovery, verification, exec-ledger, project and
+  skills families follow the same rule:
 
   | Helper | Emitted kind |
   |---|---|
@@ -650,9 +1055,13 @@ All logs in **one folder** — `logs/`, next to the database, so a container wit
   | `context_source_failed` | `context.source` |
   | `context_trimmed` | `context.trimmed` |
 
-  Plus a generic `event()` / `exception()` pair, used in production code with three
-  further dotted names — `agent.model_fallback`, `agent.part_skipped`,
-  `scheduler.error` — for **17** distinct kind strings in total.
+  Plus a generic `event()` / `exception()` pair, used in production code with **four**
+  further dotted names — `agent.model_fallback`, `agent.parallel_calls_deferred`,
+  `agent.part_skipped`, `scheduler.error` — for **35** distinct kind strings in total.
+  ⚠️ Count them by walking the helpers' own `event("…")` arguments plus a grep for
+  direct `alog.event("…")` calls in production code. A bare grep over the whole tree
+  totals **36**, because it also matches a `'test'` string from the suite — which is
+  exactly how a wrong number that *looks* derived gets quoted.
 - `AGENT2_LOG_LEVEL`, `AGENT2_LOG_COLOR` and `AGENT2_LOG_CONSOLE` tune the console
   half only.
 
@@ -695,7 +1104,7 @@ volume rather than fighting over the published port.
 ## 🧪 Tests and code quality
 
 ```bash
-python -m pytest .github/tests/                 # 1602 tests
+python -m pytest .github/tests/                 # 2670 tests
 python -m pytest .github/tests/test_config.py   # one file
 ```
 
@@ -723,8 +1132,10 @@ time before they find out.
 | | Status |
 |---|---|
 | **Agent-2-Pro** | A planned hosted edition. **Nothing** on the Pro page exists. Note that `pro` is also the name of the default *mode*, which is unrelated |
-| **`/init`** | Designed and referenced; no registry entry, no dispatcher branch |
-| **Skills and workflow context sources** | Declared in `ORDER` with **empty collectors on purpose** — a source that does not exist yet still has a name, an order and a slot in the report, so it arrives later by *registering* rather than by editing the broker |
+| **`/ultracode run` in the browser** | **Terminal-only, and the panel says so rather than hiding it.** `engine.drive()` needs a synchronous worker owning a whole model turn, and a request thread has neither the `sid` nor the stream — so the browser's *next ordinary chat turn* does that work through `workflow.for_turn()` instead |
+| **`/workflow edit` in the browser** | Terminal-only for the same class of reason: `[E]dit` launches `$VISUAL`/`$EDITOR` on the machine running the terminal, and a browser tab may be on another machine. The web half edits by POSTing a `body` |
+| **`work`, `replan`, `finalize`** | Verbs on **neither** surface. `engine.drive()` owns all three *and the order they run in*, which is the whole of the adaptive loop |
+| **`/shrink`, `/clearhistory` over HTTP** | No route at all. Inventing one to give the browser a button would be a second declaration of what shrinking a conversation means |
 | **`/mcp auto`** | Not a command. Auto-connect is set implicitly (see above) |
 | **PIL ghost text on the web** | `POST /api/pil/predict` and the `pil_predict` event both work, but no shipped front end emits either — the CLI is currently the only surface with ghost text |
 | **`file_ops` read-back** | Every operation is written; nothing reads the table back, so it is an SQL-only audit trail |
@@ -739,7 +1150,7 @@ time before they find out.
 | [`README.md`](README.md) | The short tour and the quick start |
 | [`USAGE.md`](USAGE.md) | Driving it — commands, flows, recipes |
 | [`CLAUDE.md`](CLAUDE.md) | The index of every invariant and the file that owns it |
-| [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) | 39 pages, each rule with the bug it prevents |
+| [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) | 45 pages, each rule with the bug it prevents |
 | The module docstring | The full rationale. **Read it before editing a `⚠️` module** |
 
 ---

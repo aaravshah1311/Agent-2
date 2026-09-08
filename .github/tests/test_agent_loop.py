@@ -456,6 +456,70 @@ def test_build_context_skips_orphan_tool_call(chat):
     assert [c.role for c in ctx] == ["user"]
 
 
+def test_build_context_skips_orphan_tool_result(chat):
+    """The exact mirror of the test above, and it is NOT redundant.
+
+    Gemini rejects a function_response with no matching function_call just as it
+    rejects the reverse. Only the forward half of the pairing rule was ever
+    written, which was self-consistent and half a rule.
+
+    Sabotage check: delete the `elif role == "tool_result"` guard in
+    build_context() and this fails — ctx opens with a bare function_response.
+    """
+    A.save_msg(chat, "tool_result", "orphan", {"local": "read_file", "ok": True})
+    A.save_msg(chat, "user", "hello")
+
+    ctx = A.build_context(chat)
+    assert [c.role for c in ctx] == ["user"]
+    assert not any(p.function_response for c in ctx for p in c.parts)
+
+
+def test_build_context_never_opens_with_an_orphan_function_response(chat):
+    """The window boundary is how the orphan actually happens in production.
+
+    The window is a `LIMIT MAX_CTX_MESSAGES` off the NEWEST end, so its oldest
+    row is wherever the count landed. Land it on a tool_result and the tool_call
+    that pairs with it is the row that fell off the front — so the FIRST Content
+    of a long tool-using conversation was an orphan response and the whole turn
+    died at the vendor, with no error on this side.
+
+    Sabotage check: delete the tool_result guard and this fails with one
+    unmatched function_response, ctx[0] carrying it.
+    """
+    A.save_msg(chat, "user", "read me a file")
+    A.save_msg(chat, "tool_call", "Reading: x.py",
+               {"local": "read_file", "args": {"path": "x.py"}})
+    A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
+    # Push the pair to the front edge: the window then starts ON the result.
+    for i in range(A.MAX_CTX_MESSAGES - 1):
+        A.save_msg(chat, "assistant", f"a{i}")
+
+    ctx = A.build_context(chat)
+    calls = [p.function_call for c in ctx for p in c.parts if p.function_call]
+    responses = [p.function_response for c in ctx for p in c.parts if p.function_response]
+    assert len(calls) == len(responses), f"unpaired: {len(calls)} calls, {len(responses)}"
+    # Both halves are gone, not one of them: the call was evicted by the LIMIT.
+    assert (calls, responses) == ([], [])
+    assert ctx[0].parts[0].text == "a0"
+
+
+def test_build_context_keeps_a_pair_whose_call_is_the_oldest_row(chat):
+    """The tool_result guard may not be over-eager.
+
+    A tool_call at index 0 whose result sits at index 1 is a COMPLETE pair, and
+    dropping it would silently shrink every conversation whose window happens to
+    start on a tool call — the opposite failure, equally invisible.
+    """
+    A.save_msg(chat, "tool_call", "Reading: x.py",
+               {"local": "read_file", "args": {"path": "x.py"}})
+    A.save_msg(chat, "tool_result", "contents", {"ok": True, "local": "read_file"})
+
+    ctx = A.build_context(chat)
+    assert [c.role for c in ctx] == ["model", "user"]
+    assert ctx[0].parts[0].function_call.name == "read_file"
+    assert ctx[1].parts[0].function_response.name == "read_file"
+
+
 def test_build_context_caps_at_max_messages(chat):
     pairs = A.MAX_CTX_MESSAGES + 20
     for i in range(pairs):
@@ -727,6 +791,73 @@ def test_memory_tool_writes_through_the_registry(chat, sock, monkeypatch):
         assert sock.first("chat_tool_result")["ok"] is True
     finally:
         _exe("DELETE FROM memories WHERE content LIKE ?", (f"%{marker}%",))
+
+
+# ── run_agent(): several function_calls in one response ───────────────────────
+
+def _two_calls() -> FakeResponse:
+    """One response carrying two function_call parts, in the model's own order."""
+    return FakeResponse([
+        FakePart(function_call=FakeCall("write_file", {"path": "a.txt", "content": "x"})),
+        FakePart(function_call=FakeCall("read_file", {"path": "a.txt"})),
+    ])
+
+
+def test_the_first_of_several_function_calls_is_the_one_that_runs(chat, sock, monkeypatch):
+    """Gemini may return several calls at once; this loop runs ONE per iteration.
+
+    Taking the LAST part INVERTS the order the model asked for — `write_file`
+    then `read_file` executed as `read_file` then `write_file` — which is a wrong
+    answer with no error anywhere. Running only the first is a degradation the
+    model recovers from on the next round trip; running the wrong one is not.
+
+    Sabotage check: drop the `if func_call is None:` in the extraction loop so it
+    keeps the last call, and `seen` becomes ["read_file"].
+    """
+    seen: list[str] = []
+
+    def fake_dispatch(name, args, ctx):
+        seen.append(name)
+        return {"output": "ok"}
+
+    monkeypatch.setattr(A, "dispatch_tool", fake_dispatch)
+    run(chat, sock, [_two_calls(), text_reply("done")], monkeypatch=monkeypatch)
+
+    assert seen == ["write_file"], f"ran the wrong call of the batch: {seen}"
+    assert roles(chat) == ["user", "tool_call", "tool_result", "assistant"]
+
+
+def test_deferred_parallel_calls_are_logged_not_dropped_in_silence(chat, sock, monkeypatch):
+    """A call this iteration declined to run is an audit line, not silence.
+
+    A model whose second and third calls never ran, with nothing recorded, is
+    indistinguishable from a model that only asked for one — which is the state
+    that makes the ordering bug above unfindable from the logs.
+    """
+    seen: list[tuple[str, dict]] = []
+    monkeypatch.setattr(A.alog, "event", lambda kind, **f: seen.append((kind, f)))
+    monkeypatch.setattr(A, "dispatch_tool", lambda name, args, ctx: {"output": "ok"})
+
+    run(chat, sock, [_two_calls(), text_reply("done")], monkeypatch=monkeypatch)
+
+    fields = next((f for k, f in seen if k == "agent.parallel_calls_deferred"), None)
+    assert fields is not None, f"no deferral recorded: {[k for k, _ in seen]}"
+    assert fields["kept"] == "write_file"
+    assert fields["deferred"] == 1
+
+
+def test_a_single_function_call_reports_no_deferral(chat, sock, monkeypatch):
+    """The audit line fires only when there was actually something to defer.
+
+    An event on every ordinary tool turn would make the signal worthless.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(A.alog, "event", lambda kind, **f: seen.append(kind))
+
+    run(chat, sock, [call_reply("update_todo", {"todos": []}), text_reply("done")],
+        monkeypatch=monkeypatch)
+
+    assert "agent.parallel_calls_deferred" not in seen
 
 
 # ── run_agent(): error paths and bounds ───────────────────────────────────────

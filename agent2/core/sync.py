@@ -69,6 +69,12 @@ RESOURCES = (
     # reason: toggling ZAP in the CLI must reach a web process's `/mcp` view,
     # and the poller only republishes resources it iterates.
     "mcp",
+    # Per-project skill enablement (core/skills/state.py, migration 29). ⚠️ A
+    # topic missing from this tuple reaches the other surface NEVER — and skills
+    # are read on the turn path behind a TTL cache, so without this a `/skills`
+    # toggle in the CLI would keep the web half's next prompt on the old
+    # selection until its process restarted.
+    "skills",
 )
 
 

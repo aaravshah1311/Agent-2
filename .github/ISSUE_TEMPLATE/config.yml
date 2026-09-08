@@ -5,8 +5,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: 📖 Documentation
-    url: https://github.com/aaravshah1311/Agent-2/wiki
+    url: https://github.com/Agent-2/wiki
     about: Check our documentation for answers
   - name: 💬 Discussions
-    url: https://github.com/aaravshah1311/Agent-2/discussions
+    url: https://github.com/Agent-2/discussions
     about: Ask questions and share ideas

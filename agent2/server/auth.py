@@ -60,6 +60,30 @@ before any question of who the caller is. Browsers always send at least one of
 those; `curl` sends neither, which is exactly the distinction that lets a local
 script keep working while a hostile page cannot.
 
+⚠️ AND `Host` IS CHECKED BEFORE `Origin`, BECAUSE `Origin` IS COMPARED *AGAINST*
+`Host` AND `Host` IS THE CLIENT'S.
+Origin-vs-Host refuses the ordinary hostile page — the browser puts the real
+target in `Host`, so the two disagree — and cannot refuse **DNS rebinding**, where
+they agree because the attacker owns the name on both sides. A page served from
+`evil.example` on a short TTL, whose name is then re-pointed at `127.0.0.1`, is
+*same-origin to the browser*: `Origin: http://evil.example`,
+`Sec-Fetch-Site: same-origin`, `Host: evil.example`, and `remote_addr` really is
+`127.0.0.1`. Measured before the fix: a `POST /api/memories` wrote a row (200) and
+`socket_allowed()` returned **True** — so merely visiting a page bought the API
+*and* `run_raw_command`. `host_ok()` closes it by refusing an unknown DNS **name**,
+and an **IP-literal `Host` is always allowed** because there is nothing to rebind
+about an address: loopback, the LAN address in the banner, a container IP and a
+Tailscale IP all keep working, and only the vector is refused. It is asked by
+`decide()` *above* `PUBLIC_PATHS` (nothing at all is served under a name this
+server does not answer to — least of all the login page) and again inside
+`socket_allowed()`, since the handshake never reaches `before_request`.
+
+⚠️ EVERY CREDENTIAL COMPARISON GOES THROUGH `_cmp_bytes`.
+`hmac.compare_digest` **raises** `TypeError` on a non-ASCII `str`, Werkzeug
+latin-1-decodes request headers, and `decide()` has no outer `try` — so one `0xFF`
+byte in `Authorization` or `X-A2-CSRF` turned the gate into a **500**. A gate that
+answers 500 has stopped deciding, which is the one thing this module may never do.
+
 ⚠️ CSRF IS ENFORCED ON COOKIE-AUTHENTICATED REQUESTS, NOT ON BEARER ONES.
 The double-submit pair (`a2_csrf` cookie + `X-A2-CSRF` header) only defends
 against *ambient* credentials. A caller that presents `Authorization: Bearer …`
@@ -88,6 +112,7 @@ import hmac
 import ipaddress
 import os
 import secrets
+import socket
 import threading
 import time
 from collections import deque
@@ -250,11 +275,36 @@ def rotate_token() -> str:
     return fresh
 
 
+def _cmp_bytes(value: str) -> bytes:
+    """Encode a credential for `hmac.compare_digest`, which cannot take one raw.
+
+    ⚠️ `compare_digest` **RAISES** `TypeError: comparing strings with non-ASCII
+    characters is not supported` when either `str` argument is non-ASCII, and every
+    caller below is fed request data. Werkzeug latin-1-decodes HTTP headers, so a
+    single `0xFF` byte in `Authorization`, `X-A2-Token`, `?token=` or `X-A2-CSRF`
+    arrives as `'ÿ'` — and `decide()` has no outer `try`, so that `TypeError`
+    escaped `before_request` and Flask rendered a **500**. A gate that answers "500"
+    has not refused anything: it has stopped deciding, which is the one thing this
+    module may never do. (`socket_allowed()` was unaffected only because its blanket
+    `except` already fails closed.)
+
+    ⚠️ Encoded, never rejected-if-non-ASCII: `AGENT2_WEB_TOKEN` is an operator's own
+    string and `os.environ` on POSIX can legitimately hand back undecodable bytes as
+    surrogates, so refusing non-ASCII outright would lock such an operator out of
+    their own server. ⚠️ And `surrogatepass`, never `replace`: `replace` maps every
+    unencodable character onto one replacement byte, so two *different* candidates
+    could compare equal — a comparison hardened against timing that had been
+    silently weakened against content. `surrogatepass` encodes any `str` at all, and
+    injectively, which is what a credential comparison needs.
+    """
+    return str(value).encode("utf-8", "surrogatepass")
+
+
 def token_matches(candidate: str) -> bool:
     """Constant-time comparison against the access token."""
     if not candidate:
         return False
-    return hmac.compare_digest(str(candidate), access_token())
+    return hmac.compare_digest(_cmp_bytes(candidate), _cmp_bytes(access_token()))
 
 
 # ── Hashing / time helpers ────────────────────────────────────────────────────
@@ -448,8 +498,120 @@ def rate_reset() -> None:
         _RATE.clear()
 
 
-# ── Origin / CSRF ─────────────────────────────────────────────────────────────
+# ── Host / Origin / CSRF ──────────────────────────────────────────────────────
+def _bare_host(raw: str) -> str:
+    """Strip brackets and a trailing port from a `host[:port]` string.
+
+    One spelling for both readers — the request's own `Host` and the entries of
+    `AGENT2_WEB_ORIGINS` — because an allowlist that keeps the port on one side and
+    drops it on the other never matches, and the symptom is a 403 nobody can
+    explain. A bracket-less address carrying more than one colon is a bare IPv6
+    literal and is left whole; splitting it would produce a prefix.
+    """
+    raw = (raw or "").strip().lower().rstrip("/")
+    if raw.startswith("["):
+        end = raw.find("]")
+        return raw[1:end] if end > 0 else raw[1:]
+    if raw.count(":") == 1:
+        raw = raw.split(":", 1)[0]
+    return raw
+
+
+def _is_ip_literal(host: str) -> bool:
+    """Whether `host` is an IP address rather than a name."""
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
+
+
+_OWN_NAMES_LOCK = threading.Lock()
+_OWN_NAMES: frozenset[str] | None = None
+
+
+def own_names() -> frozenset[str]:
+    """Names this machine legitimately answers to, resolved once per process.
+
+    `socket.gethostname()` only reads the configured hostname — no DNS, no reverse
+    lookup — so it is safe on the request path. ⚠️ `socket.getfqdn()` is deliberately
+    NOT consulted: it can perform a reverse lookup that blocks for the resolver's
+    whole timeout, and a hostname allowlist that can hang is a hostname allowlist
+    that hangs every request on a box with a sick resolver. A deployment reached
+    under any other name says so in `AGENT2_WEB_ORIGINS`.
+    """
+    global _OWN_NAMES
+    with _OWN_NAMES_LOCK:
+        if _OWN_NAMES is None:
+            names = {"localhost", "localhost.localdomain"}
+            try:
+                host = (socket.gethostname() or "").strip().lower()
+            except Exception:
+                host = ""
+            if host:
+                names.add(host)
+                names.add(host.split(".", 1)[0])
+            _OWN_NAMES = frozenset(n for n in names if n)
+        return _OWN_NAMES
+
+
+def _origin_hosts() -> frozenset[str]:
+    """The host halves of `AGENT2_WEB_ORIGINS` — the `Host` half of that escape hatch.
+
+    Read live, exactly as `extra_origins()` is: one variable configures both checks,
+    so an operator who names their proxy once is not asked to name it twice.
+    """
+    return frozenset(_bare_host(o.split("://", 1)[-1]) for o in extra_origins())
+
+
+def host_ok(req) -> bool:
+    """Whether `Host` names something this server may answer to. Blocks DNS rebinding.
+
+    ⚠️ THIS EXISTS BECAUSE `_allowed_origins()` IS BUILT FROM `Host`, AND `Host` IS
+    THE CLIENT'S. Comparing `Origin` against `Host` refuses the *ordinary* hostile
+    page — the browser sets `Host` to the real target, so the two disagree — but it
+    cannot refuse **DNS rebinding**, where they agree because the attacker owns the
+    name on both sides. Serve a page from `evil.example` on a short TTL, re-point
+    `evil.example` at `127.0.0.1`, and the browser then believes its own fetches are
+    same-origin: it sends `Origin: http://evil.example`, `Sec-Fetch-Site:
+    same-origin` and `Host: evil.example`, while `remote_addr` really is `127.0.0.1`.
+    So `origin_ok()` passed, loopback trust applied in the default `auto` mode, and
+    merely *visiting a page* bought the whole API plus `run_raw_command` — remote
+    code execution, from a check that reads as a CSRF defence and is one.
+
+    ⚠️ AN IP-LITERAL `Host` IS ALWAYS ACCEPTED, AND THAT ASYMMETRY IS THE WHOLE FIX.
+    Rebinding needs a *name* to re-point; an address literal has nothing to rebind.
+    So `http://127.0.0.1:1311`, the LAN address in the startup banner, a container
+    IP, a Tailscale IP and an IPv6 literal all keep working untouched, and only an
+    **unknown DNS name** is refused — which is exactly the vector and nothing else.
+    That is what keeps this from being the "unnecessary security restriction that
+    breaks legitimate functionality" a blanket name allowlist would have been.
+
+    ⚠️ ASKED FOR EVERY METHOD, NOT JUST THE UNSAFE ONES. `origin_ok()` guards unsafe
+    methods because a cross-site *read* is already stopped by the browser; a rebound
+    origin is same-origin, so the browser hands the response back and a plain
+    `GET /api/chats` is the entire conversation history. Whoever the caller turns out
+    to be is a later question — hence the check sits above `PUBLIC_PATHS` too: under
+    a name this server does not answer to, nothing is served at all.
+
+    An absent `Host` (HTTP/1.0, a hand-rolled client) is allowed: there is no name to
+    rebind, and no browser omits it.
+    """
+    host = _bare_host(getattr(req, "host", ""))
+    if not host:
+        return True
+    if _is_ip_literal(host):
+        return True
+    return host in own_names() or host in _origin_hosts()
+
+
 def _allowed_origins(req) -> set[str]:
+    """Origins that count as "this site" for `req`.
+
+    ⚠️ Still derived from `Host`, and that is only safe because `host_ok()` has
+    already refused every name this server does not answer to. Wire one without the
+    other and the allowlist is the client's to write — see `host_ok`'s docstring.
+    """
     host = (getattr(req, "host", "") or "").lower().rstrip("/")
     out = set(extra_origins())
     if host:
@@ -479,17 +641,22 @@ def origin_ok(req) -> bool:
 
 
 def csrf_ok(req, row: dict | None) -> bool:
-    """Double-submit check: cookie value, header value and stored digest agree."""
+    """Double-submit check: cookie value, header value and stored digest agree.
+
+    Every comparison goes through `_cmp_bytes` — see its docstring for why a raw
+    `str` here turned a non-ASCII `X-A2-CSRF` header into a 500.
+    """
     if not row:
         return False
     header = (req.headers.get(CSRF_HEADER) or "").strip()
     cookie = (req.cookies.get(CSRF_COOKIE) or "").strip()
     if not header or not cookie:
         return False
-    if not hmac.compare_digest(header, cookie):
+    if not hmac.compare_digest(_cmp_bytes(header), _cmp_bytes(cookie)):
         return False
     stored = str(row.get("csrf_hash") or "")
-    return bool(stored) and hmac.compare_digest(_digest(header), stored)
+    return bool(stored) and hmac.compare_digest(_cmp_bytes(_digest(header)),
+                                                _cmp_bytes(stored))
 
 
 # ── The verdict ───────────────────────────────────────────────────────────────
@@ -542,15 +709,25 @@ def decide(req) -> Verdict:
 
     Order matters and each step is a different question:
       1. rate limit   — cheapest, and applies even to public paths
-      2. origin       — did a *different site* cause this? (unsafe methods)
-      3. identity     — session cookie, bearer token, or trusted loopback
-      4. CSRF         — only for ambient (cookie) credentials
-      5. capability   — is this identity permitted THIS operation? (Task 15)
+      2. host         — is this server even known by that name? (DNS rebinding)
+      3. origin       — did a *different site* cause this? (unsafe methods)
+      4. identity     — session cookie, bearer token, or trusted loopback
+      5. CSRF         — only for ambient (cookie) credentials
+      6. capability   — is this identity permitted THIS operation? (Task 15)
 
-    ⚠️ Step 5 is last for a reason. Answering "you may not do that" to a caller
+    ⚠️ Step 6 is last for a reason. Answering "you may not do that" to a caller
     whose identity is still unknown tells a stranger which endpoints exist and
     which are guarded; answering "who are you" first means an anonymous prober
     learns nothing beyond "authentication required".
+
+    ⚠️ Step 2 sits ABOVE `PUBLIC_PATHS` and `LOOPBACK_PATHS`, which is the only
+    placement that works: under a name this server does not answer to, nothing at
+    all may be served — not the stylesheet, not `/api/auth/status`, and above all
+    not the login page, which under a rebound name is a credential-phishing form
+    wearing this server's clothes. It is also the one step that applies to **safe**
+    methods, because a rebound origin *is* same-origin to the browser, so the
+    response comes back and a plain `GET /api/chats` is the whole transcript.
+    See `host_ok()` for the attack and why an IP-literal `Host` is exempt.
     """
     path = str(getattr(req, "path", "") or "")
     method = str(getattr(req, "method", "GET") or "GET").upper()
@@ -566,6 +743,13 @@ def decide(req) -> Verdict:
     if m == MODE_OFF:
         return Verdict(True, code="off", text=_OK_OFF, trusted=True)
 
+    # 2. Host — refuse a name this server does not answer to, before anything is
+    #    served under it. An IP literal cannot be rebound and is always allowed.
+    if not host_ok(req):
+        return Verdict(False, status=403, code="bad_host",
+                       text="Unrecognised Host — refused. Add the name to "
+                            "AGENT2_WEB_ORIGINS if you reach this server through it.")
+
     loopback = is_loopback(ip)
     trusted = loopback and m == MODE_AUTO
 
@@ -574,17 +758,17 @@ def decide(req) -> Verdict:
     if path in LOOPBACK_PATHS and loopback:
         return Verdict(True, code="loopback", trusted=trusted)
 
-    # 2. Origin — an unsafe method caused by another site is refused outright,
+    # 3. Origin — an unsafe method caused by another site is refused outright,
     #    whoever the caller turns out to be.
     if method not in SAFE_METHODS and not origin_ok(req):
         return Verdict(False, status=403, code="bad_origin",
                        text="Cross-origin request refused.")
 
-    # 3. Identity.
+    # 4. Identity.
     cookie = (req.cookies.get(SESSION_COOKIE) or "").strip()
     row = lookup_session(cookie) if cookie else None
     if row is not None:
-        # 4. CSRF applies to the ambient credential only.
+        # 5. CSRF applies to the ambient credential only.
         if method not in SAFE_METHODS and not csrf_ok(req, row):
             return Verdict(False, status=403, code="csrf",
                            text="Missing or invalid CSRF token.")
@@ -707,10 +891,18 @@ def socket_allowed(req) -> bool:
 
     A WebSocket upgrade is also exempt from CORS by design, so `Origin` is checked
     here even though the handshake is a GET.
+
+    ⚠️ AND SO IS `Host`, FOR THE SAME REASON — `decide()`'s step 2 is not reached
+    here either. Without it a DNS-rebound page passed this gate (measured: `True`),
+    which is the `run_raw_command` door: remote code execution from a visit. Both
+    surfaces ask `host_ok()` or only one of them is defended, and the undefended one
+    is the one that runs shell commands.
     """
     try:
         if mode() == MODE_OFF:
             return True
+        if not host_ok(req):
+            return False
         origin = (req.headers.get("Origin") or "").strip().rstrip("/").lower()
         if origin and origin != "null" and origin not in _allowed_origins(req):
             return False

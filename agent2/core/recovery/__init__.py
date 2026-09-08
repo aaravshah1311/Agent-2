@@ -3,12 +3,26 @@
 # github: github.com/aaravshah1311
 
 """
-agent2/core/recovery.py
-───────────────────────
+agent2/core/recovery/
+─────────────────────
 Task 3 — automatic recovery of work that was interrupted mid-flight.
 `core/tasks.py` owns the durable state; this module answers the three questions a
 restart has to ask of it: *what was running*, *did it actually land*, and *what
 must never run again*.
+
+Phase 8 made this a PACKAGE rather than a second "recovery" module, for the same
+reason `core/broker/` is one: there is exactly one place that decides what happens
+to interrupted work, and a sibling `crashrecovery.py` would have been a second one
+that drifts. What lives where:
+
+  ``__init__.py``  (this file) — Task 3: recovery of a task SESSION's checklist.
+                   `candidates` · `plan` · `verify` · `describe` · `adopt` ·
+                   `recover` · `abandon` · the model brief. Unchanged by Phase 8.
+  ``safety.py``    — Task 26 §1: what KIND of operation this was, and whether an
+                   operation of that kind may be repeated at all.
+  ``classify.py``  — Task 25 §3: what may be done with one interrupted execution.
+  ``crash.py``     — Task 25: the startup scan, the recovery state machine, and
+                   the durable record of every decision it made.
 
 ⚠️ NOT `/pause`, AND NOT `/resume`
 ───────────────────────────────────
@@ -39,6 +53,14 @@ was in flight when the process died and NOBODY knows whether it landed.
 Only `not_applied` is safe to repeat unattended. The other three surface to the
 user AND to the model as an explicit warning, because "retry and hope" on a
 half-finished `delete_file` or a `git commit` is the exact damage rule 21 forbids.
+
+⚠️ `verify_step()` IS THE mtime HEURISTIC AND IT STAYS THE FALLBACK, NOT THE
+ANSWER. It reads a checkpoint step, which records one target path and no content,
+so "exists and is newer than the step" is the most it can conclude. Task 24's
+ledger records real content digests taken *before* the tool ran, so
+`classify.py` prefers those and falls back to here only for a step the ledger
+never saw. Two readers, one for each kind of evidence — and the weaker one may
+never overrule the stronger.
 
 Presentation lives elsewhere, as always: `cli/taskview.render_recovery()` draws
 the terminal panel and the browser reads `checkpoints[…].recovered` out of

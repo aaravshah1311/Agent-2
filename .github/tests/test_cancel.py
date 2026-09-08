@@ -648,3 +648,137 @@ def test_stop_agent_wires_the_command_cancel():
     for needed in ("scheduler.cancel(", "sessions.cancel(", "_term_stop(",
                    "_term_cancel(", "_checkpoint_stop(", "agent_stopped"):
         assert needed in body, f"on_stop_agent no longer calls {needed}"
+
+
+# ── A custom provider's tool BATCH: the cancel is asked per CALL ──────────────
+#
+# The third agent loop escalates from one tool per iteration to a whole BATCH per
+# iteration, and the cancel token did not follow it down. `run_provider_agent`
+# asked `stop.is_set()` before the model call and after a provider error, never
+# between the tools of a batch — so a Stop pressed while call 1 of a 6-call batch
+# ran let calls 2..6 finish, `run_command`, `write_file` and `delete_file`
+# included. That is the same sentence at the top of this file, one nesting level
+# down: pressing Stop must stop the WORK, and it may not depend on how many tools
+# the model happened to ask for at once.
+
+
+def _batch_loops():
+    """The `for tc in tool_calls:` loops in `run_provider_agent`, from real AST.
+
+    Evaluated AST, never a source-text search: this repository has been bitten
+    twice by assertions that a docstring or a comment could satisfy.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from agent2.llm import provider_agent as PA
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PA.run_provider_agent)))
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.For)
+            and isinstance(n.iter, ast.Name) and n.iter.id == "tool_calls"]
+
+
+def test_every_batch_loop_asks_the_cancel_token_before_running_a_tool():
+    """One wire format guarded and the other not is the invisible half of this bug.
+
+    Both branches execute the same tools through the same `_exec_tool`; a user on
+    an OpenAI-compatible endpoint and a user on an Anthropic one get the same
+    promise, so the guard is asserted structurally over EVERY such loop rather
+    than by driving each one — a third wire format added without it fails here.
+
+    Sabotage check: delete either `if stop.is_set():` from the two batch loops in
+    provider_agent.py and this fails naming that loop's line.
+    """
+    import ast
+
+    loops = _batch_loops()
+    assert len(loops) == 2, f"expected one batch loop per wire format, found {len(loops)}"
+
+    for loop in loops:
+        head = loop.body[0]
+        assert isinstance(head, ast.If), (
+            f"the batch loop at line {loop.lineno} does not OPEN with a guard: "
+            f"{type(head).__name__}")
+        # `stop.is_set()` — an attribute call on the cancel token, evaluated.
+        test = head.test
+        assert (isinstance(test, ast.Call) and isinstance(test.func, ast.Attribute)
+                and test.func.attr == "is_set"
+                and isinstance(test.func.value, ast.Name)
+                and test.func.value.id == "stop"), (
+            f"the guard at line {loop.lineno} is not stop.is_set(): {ast.dump(test)[:120]}")
+        # It must LEAVE, not merely notice: a `continue` would run the rest anyway.
+        assert any(isinstance(n, ast.Return) for n in ast.walk(head)), (
+            f"the guard at line {loop.lineno} does not return")
+        assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "_stopped" for n in ast.walk(head)), (
+            f"the guard at line {loop.lineno} does not go through _stopped()")
+
+
+@pytest.mark.parametrize("fmt", ["anthropic", "openai"])
+def test_a_stop_mid_batch_abandons_the_rest_of_the_tools(monkeypatch, fmt):
+    """The behaviour the AST test above only describes, on both wire formats.
+
+    A model asks for four `run_command`s at once; the user presses Stop while the
+    first is still running. Exactly one may have run.
+
+    ⚠️ Abandoning a half-answered batch is safe ON THE WIRE, which is why no
+    filler tool_result is synthesised: `messages` is reseeded on every turn from
+    `role IN ('user','assistant')` rows only, so the unanswered `tool_use` never
+    reaches a provider that would reject it.
+
+    Sabotage check: delete the guard from one branch and only that
+    parametrization fails, with all four commands in `ran`.
+    """
+    import uuid
+
+    from agent2.database import exe, init_db
+    from agent2.llm import provider_agent as PA
+
+    init_db()
+    cid = f"cancel-batch-{fmt}-{uuid.uuid4().hex[:8]}"
+    exe("INSERT INTO chats(id, title) VALUES(?, ?)", (cid, "batch"))
+
+    batch = [{"id": f"c{i}", "name": "run_command", "args": {"command": f"echo {i}"}}
+             for i in range(4)]
+    reply = {"tokens": 7, "tool_calls": batch, "text": "",
+             "raw_content": [], "raw_assistant": None}
+
+    monkeypatch.setattr(PA, "providers", SimpleNamespace(
+        get_provider=lambda _pid: {"id": "p1", "format": fmt, "model_id": "m"},
+        chat=lambda *a, **k: reply))
+    monkeypatch.setattr(PA, "mcp_registry", SimpleNamespace(
+        extra_bridges=lambda: [], ensure_connected=lambda *a, **k: None))
+    monkeypatch.setattr(PA, "burp", SimpleNamespace(
+        enabled=False, is_connected=lambda: False, list_tools=lambda: []))
+    # A real assemble() forks `git` and walks the project; the bundle is not what
+    # is under test, and system_prompt(context=None) documents its own fallback.
+    monkeypatch.setattr(PA, "_broker", SimpleNamespace(assemble=lambda **k: None))
+    # Keep the ~10% background PIL optimize thread out of the test DB.
+    monkeypatch.setattr(PA, "random", SimpleNamespace(random=lambda: 1.0))
+
+    ran: list[str] = []
+
+    def fake_exec(name, args, sid, term_id, socketio, ctx=None, prog=None):
+        ran.append(args.get("command", name))
+        if len(ran) == 1:               # the user hits Stop while call 1 is running
+            ctx.session.cancel.set()
+        return "out", True
+
+    monkeypatch.setattr(PA, "_exec_tool", fake_exec)
+
+    sock = _Sock()
+    try:
+        PA.run_provider_agent(cid, "do four things", f"sid-{fmt}", f"t-{fmt}", "p1", sock)
+    finally:
+        exe("DELETE FROM messages WHERE chat_id=?", (cid,))
+        exe("DELETE FROM chats WHERE id=?", (cid,))
+
+    assert ran == ["echo 0"], f"a cancelled batch still ran {len(ran)} tools: {ran}"
+
+    # And the browser is told the turn is over — a `done` it never gets leaves the
+    # composer stuck with no error anywhere.
+    done = [p for p in sock.of("chat_response") if p.get("done")]
+    assert done, f"no terminal chat_response: {[e for e, _p in sock.events]}"
+    assert done[-1]["text"] == "_Stopped by user._", done[-1]

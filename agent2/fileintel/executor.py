@@ -64,6 +64,11 @@ class ToolExecutor:
             resolved = security.preflight(
                 path, workspace_root=workspace_root, allow_executable=allow_exec,
             )
+            # The subject path is not the only path here: `options` is
+            # model-supplied and several plugins write to a path taken straight
+            # out of it. Confine those through the same rule, once, rather than
+            # in each plugin that honours one.
+            options = security.confine_options(options, workspace_root)
             det = detect(str(resolved))
             fmt = options.get("format") or det["format"]
             _progress(f"Detected: {fmt or 'unknown'} ({det['category'] or 'uncategorised'})")

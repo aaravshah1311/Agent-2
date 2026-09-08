@@ -7,13 +7,29 @@ agent2/cli/tooling.py
 ─────────────────────
 What the CLI tells the model it can do, and what actually happens when it asks.
 
-⚠️ ONE BACKEND, AND THE SPLIT BETWEEN THEM IS DELIBERATE.
+⚠️ ONE BACKEND, AND IT IS AN ABSENCE RATHER THAN A CONVENTION.
 Every filesystem- or sandbox-sensitive tool is routed to `agent2.tools`, the
 shared workspace-confined registry the Web UI uses — `_SHARED_TOOLS` is that
 list. Only genuinely presentation-layer tools stay local: `web_search`,
 `save_memory` and `emit_plan` print into *this* terminal, so delegating them
-would change their behaviour. Re-implementing a shared tool here would give the
-CLI a second sandbox with its own bugs.
+would change their behaviour. This module therefore performs **no filesystem
+operation at all** — no `open`, no `read_text`/`write_text`, no `os.walk`, no
+`mkdir` — and that is asserted structurally, not promised, because the claim was
+false for a whole phase: `_impl_read`, `_impl_write`, `_impl_scan_project` and
+`_impl_multi_edit` sat right here, resolving `Path(args["path"]).expanduser()`
+and calling bare `open()`/`write_text()`. Three were unreachable (`dispatch_tool`
+tests `_SHARED_TOOLS` first), but `_impl_read` was live behind the `/read` slash
+command — a human-facing filesystem read with no `_ws.validate_path` confinement,
+no capability gate (`read_file` is `CAP_READ`, which `AGENT2_DENY_CAPS` subtracts
+process-wide), no `alog.tool_exec` audit line, and its own private 64 000-char cap
+where `agent2.tools` and the docs both say 100 000. A second sandbox with its own
+bugs is exactly what that was.
+
+⚠️ A HUMAN-FACING COMMAND THAT PERFORMS A GATED OPERATION STILL ASKS THE GATE.
+`/read` now goes through `dispatch_tool("read_file", …)`, the same reason `/run`
+carries its own exec gate rather than trusting that the operator typed it: the
+capability model describes *this process*, CLI included, so a command that
+bypasses it makes `AGENT2_DENY_CAPS` a statement about the browser alone.
 
 ⚠️ `_build_tools()` IS WHAT THE MODEL IS TOLD EXISTS, AND `dispatch_tool()` IS
 WHAT CAN BE ROUTED. If a name is advertised but not dispatchable, the model calls
@@ -33,45 +49,15 @@ import json
 import os
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 from agent2.cli.env import OS_NAME, _burp, _BURP_OK, _mcp_registry, _MCP_OK, gtypes
 from agent2.cli.models import SHELL_LABEL
 from agent2.cli.render import print_plan
 from agent2.cli.store import add_mem
 
-# ── Tool implementations (same logic as web app) ───────────────────────────────
-MAX_FILE = 64_000
-_SKIP    = {"__pycache__", ".git", "node_modules", ".venv", "venv", "env",
-            "dist", "build", ".next", "target", ".DS_Store"}
-
-def _impl_read(args: dict) -> dict:
-    p = Path(args["path"]).expanduser()
-    s = args.get("start_line"); e = args.get("end_line")
-    try:
-        if not p.exists(): return {"error": f"Not found: {p}"}
-        with open(p, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        total = len(lines)
-        sl, el = (s - 1 if s else 0), (e if e else total)
-        content = "".join(lines[sl:el])
-        if len(content) > MAX_FILE:
-            content = content[:MAX_FILE] + "\n…[truncated]"
-        return {"content": content, "total_lines": total, "path": str(p)}
-    except Exception as ex: return {"error": str(ex)}
-
-def _impl_write(args: dict) -> dict:
-    p = Path(args.get("path", "")).expanduser()
-    content = args.get("content", "")
-    if not content: return {"error": "content is required"}
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        lines = content.count("\n") + 1
-        return {"success": True, "path": str(p), "lines": lines}
-    except Exception as ex: return {"error": str(ex)}
-
-
+# ── The three CLI-local tool implementations ──────────────────────────────────
+# There is no filesystem code in this module, and that absence is the invariant —
+# see the module docstring. Anything that touches a path goes to `agent2.tools`.
 
 def _impl_search(args: dict) -> dict:
     q = args.get("query", "")
@@ -113,82 +99,20 @@ def _impl_plan(args: dict) -> dict:
     return {"plan_emitted": True}
 
 
-def _impl_scan_project(args: dict) -> dict:
-    raw = args.get("path", ".")
-    p = Path(raw).expanduser()
-    if not p.is_absolute():
-        p = Path(os.getcwd()) / p
-    p = p.resolve()
-    if not p.exists() or not p.is_dir(): return {"error": f"Invalid directory: {p}"}
-
-    important_exts = {".py", ".js", ".html", ".css", ".json", ".md", ".txt", ".ts", ".tsx",
-                      ".jsx", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb",
-                      ".php", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".env", ".sql",
-                      ".sh", ".bat", ".ps1", ".xml", ".svg", ".lock"}
-    skip_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build",
-                 ".next", "target", ".DS_Store", ".idea", ".vscode", "coverage", ".cache"}
-
-    # Build a file tree first
-    tree_lines = [f"Project root: {p}"]
-    contents = []
-    total_size = 0
-
-    import os as _os
-    for root, dirs, files in _os.walk(p):
-        dirs[:] = sorted([d for d in dirs if d not in skip_dirs])
-        level = len(Path(root).relative_to(p).parts)
-        indent = "  " * level
-        tree_lines.append(f"{indent}{Path(root).name}/")
-        for fname in sorted(files):
-            fp = Path(root) / fname
-            if fp.suffix in important_exts:
-                tree_lines.append(f"{indent}  {fname}  ({fp.stat().st_size} bytes)")
-                try:
-                    text = fp.read_text(encoding="utf-8", errors="replace")
-                    if len(text) > 50000: text = text[:50000] + "\n...[truncated]"
-                    contents.append(f"\n{'='*60}\n FILE: {fp.relative_to(p)}\n{'='*60}\n{text}")
-                    total_size += len(text)
-                    if total_size > 300000:
-                        contents.append("\n--- [TRUNCATED: Project too large, remaining files skipped] ---")
-                        break
-                except Exception:
-                    pass
-        if total_size > 300000:
-            break
-
-    file_tree = "\n".join(tree_lines)
-    file_contents = "\n".join(contents) if contents else "No important text files found."
-    return {"file_tree": file_tree, "file_count": len(contents), "project_contents": file_contents}
-
-def _impl_multi_edit(args: dict) -> dict:
-    edits = args.get("edits", [])
-    results = []
-    for edit in edits:
-        p = Path(edit.get("path", "")).expanduser()
-        old_text = edit.get("old_text", "")
-        new_text = edit.get("new_text", "")
-        if not p.exists():
-            results.append(f"{p}: File not found")
-            continue
-        try:
-            c = p.read_text(encoding="utf-8")
-            if old_text not in c:
-                results.append(f"{p}: old_text not found")
-            else:
-                p.write_text(c.replace(old_text, new_text), encoding="utf-8")
-                results.append(f"{p}: Successfully edited")
-        except Exception as e:
-            results.append(f"{p}: Error {e}")
-    return {"results": "\n".join(results)}
-
-# Section 10: ONE backend. All filesystem/sandbox-sensitive tools and the File
-# Intelligence tools go through the shared, workspace-sandboxed registry in
-# agent2.tools — the CLI no longer re-implements them. Only genuinely
-# CLI-presentation tools (web_search/save_memory/emit_plan) stay local.
+# ⚠️ ONE BACKEND. Every filesystem- or sandbox-sensitive tool — and every File
+# Intelligence tool — is routed to the shared, workspace-confined registry in
+# `agent2.tools`; only the three CLI-presentation tools above stay local.
+# ⚠️ A name dropped from this frozenset does not fall back to anything: it falls
+# through to "not registered", which is loud. That is deliberate. The CLI used to
+# carry its own `_impl_read`/`_impl_write`/`_impl_scan_project`/`_impl_multi_edit`
+# beside this list, so a dropped name silently landed on an unconfined copy with
+# no `_safe_path`, no capability gate and no audit line — a second sandbox with
+# its own bugs, exactly as the docstring warns. They are gone; keep them gone.
 # Module-level and frozen: this used to be rebuilt on every single tool call.
 _SHARED_TOOLS = frozenset((
     "read_file", "write_file", "scan_project", "multi_edit_files",
     "list_dir", "delete_file", "grep_search", "update_todo",
+    "update_project_doc",
     "detect_file", "file_capabilities", "run_file_op", "convert_file",
     "search_workspace",
 ))
@@ -327,4 +251,79 @@ def _build_tools():
                     "status": S(type=T.STRING),
                 }))
             }, required=["todos"])),
+        gtypes.FunctionDeclaration(name="update_project_doc",
+            description="Re-scan this project and refresh its .agent2/agent2.md brief "
+                        "(purpose, features, architecture, commands, layout). Call AFTER you "
+                        "finish work that CHANGED what the project contains — a new feature, "
+                        "module, entry point, dependency, command, test suite or a restructure "
+                        "— so the doc the next turn reads is still true. Anything a human wrote "
+                        "in it is preserved. Set describe=true ONLY when you changed what the "
+                        "project is FOR (a new purpose or a headline feature). Do NOT call it "
+                        "after read-only work, a one-line fix, or a question. No arguments "
+                        "required.",
+            parameters=S(type=T.OBJECT, properties={
+                "describe": S(type=T.BOOLEAN),
+                "hint":     S(type=T.STRING),
+            })),
+        # ── File Intelligence System ────────────────────────────────────────────
+        # ⚠️ These five are in `_SHARED_TOOLS`, so `dispatch_tool` has always been
+        # able to route them — they were simply never DECLARED here, and a tool the
+        # model is not told about is a tool that is never called. The CLI is the
+        # default surface, so the whole subsystem was unreachable from it while the
+        # browser used it freely, with no error on either side. Descriptions are
+        # each surface's own prose (five of the thirteen above already differ from
+        # `tools.py`); the NAMES are the invariant, pinned in both directions by
+        # `test_cli.py::test_advertised_and_dispatchable_tools_agree_both_ways`.
+        gtypes.FunctionDeclaration(name="detect_file",
+            description="Auto-detect a file's type, rich metadata (size, dates, checksum, page count, dimensions, duration), and the list of operations available for it. Call this FIRST for any file the user references before deciding what to do.",
+            parameters=S(type=T.OBJECT, properties={
+                "path": S(type=T.STRING),
+            }, required=["path"])),
+        gtypes.FunctionDeclaration(name="file_capabilities",
+            description="List the operations available for a file path OR a whole category (documents, spreadsheets, presentations, images, audio, video, archives, code). Use to discover what you can do before calling run_file_op.",
+            parameters=S(type=T.OBJECT, properties={
+                "path":     S(type=T.STRING),
+                "category": S(type=T.STRING),
+            })),
+        gtypes.FunctionDeclaration(name="run_file_op",
+            description=(
+                "Universal file operation. Auto-detects the file type and routes to the "
+                "right backend. Operations by category: documents (read, extract_text, "
+                "summarize, translate, rewrite, grammar, compare, merge, split, "
+                "extract_images, ocr, convert); spreadsheets (read, analyze, formula_audit, "
+                "clean, export_csv, convert); presentations (read, speaker_notes, translate, "
+                "convert); images (metadata, convert, compress, resize, ocr); archives "
+                "(list, extract, inspect, create); audio/video (metadata, convert, "
+                "extract_audio, transcribe); code (read, analyze). For AI ops "
+                "(summarize/translate/rewrite/grammar) the tool returns the extracted text "
+                "with an instruction — YOU then produce the transformed text and, if asked, "
+                "save it with write_file. Pass batch inputs (e.g. multiple PDFs to merge) in "
+                "options.paths. Common options: to_format, output_path, other (for compare), "
+                "quality/width/height (images), target_language, paths."
+            ),
+            parameters=S(type=T.OBJECT, properties={
+                "path":      S(type=T.STRING),
+                "operation": S(type=T.STRING),
+                "options":   S(type=T.OBJECT),
+            }, required=["path", "operation"])),
+        gtypes.FunctionDeclaration(name="convert_file",
+            description="Convert a file to another format. The best backend is chosen automatically (e.g. DOCX/PPTX/XLSX/MD/HTML/image → PDF, image ↔ image, CSV ↔ XLSX, media transcode). Falls back gracefully if a backend is missing.",
+            parameters=S(type=T.OBJECT, properties={
+                "path":        S(type=T.STRING),
+                "to_format":   S(type=T.STRING),
+                "output_path": S(type=T.STRING),
+            }, required=["path", "to_format"])),
+        gtypes.FunctionDeclaration(name="search_workspace",
+            description=(
+                "Search across many files at once. kind='content' (regex/keyword over code, "
+                "text AND document text like PDF/DOCX), 'filename', 'recent' (query = number "
+                "of days), 'secrets' (find API keys/credentials), 'duplicates' (find identical "
+                "files). Natural-language presets work too: 'invoices', 'TODOs', 'API keys', "
+                "'duplicates'."
+            ),
+            parameters=S(type=T.OBJECT, properties={
+                "query": S(type=T.STRING),
+                "path":  S(type=T.STRING),
+                "kind":  S(type=T.STRING),
+            }, required=["query"])),
     ])

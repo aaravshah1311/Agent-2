@@ -10,32 +10,28 @@ Call register_routes(app) from main.py after creating the app instance.
 
 HEALTH REPORTING (`GET /api/health`) — 200 healthy / 503 + `problems`
 ────────────────────────────────────────────────────────────────────
-Reports DB reachability + schema version, pool, WAL, scheduler and sync poller.
+⚠️ THIS FILE NO LONGER BUILDS THE REPORT — `agent2/core/health.py` DOES.
+The fourteen sections, the fault rules, the `warnings` list and the per-subsystem
+`✓/⚠/✗/○` verdict all live there, because Task 28 asks for that verdict list on
+the CLI as well and the CLI has no Flask app to call. Read that module's docstring
+for every invariant that used to be stated here; this route is a `jsonify()` and a
+status code, and `ok` decides which.
 
-⚠️ A DISABLED OPTIMIZATION IS NOT UNHEALTHY.
-The WAL checkpointer and the turn scheduler can both be switched off on purpose.
-Reporting "degraded" for a supported configuration produces an alert people
-learn to ignore, which is worse than no alert.
-
-⚠️ THE SCHEDULER CHECK IS `worker_starts and not workers`, NOT
-`enabled and not workers`.
-`submit()` starts workers lazily, so an enabled pool with zero workers is the
-NORMAL state of a server that has not handled a turn yet — the naive form
-returned 503 on a healthy app. The real fault being detected is workers that
-started and then went away. (test_idle_server_is_healthy)
-
-⚠️ EVERY SECTION IS ISOLATED BEHIND `_section()`.
-A health endpoint that 500s because one counter raised reports the whole app
-down when only the reporting broke.
-
-⚠️ THE DB IS THE ONLY HARD DEPENDENCY.
+Do not re-derive a section, a fault or a verdict here. A second copy would agree
+on the day it was written and drift silently afterwards, with the JSON and the
+terminal each looking perfectly correct on its own.
 
 ⚠️ `/api/health` CARRIES COUNTERS ONLY, AND IT IS THE ONE ROUTE HERE THAT AN
 UNAUTHENTICATED CALLER CAN REACH — from loopback, so Docker's healthcheck keeps
 working (`auth.LOOPBACK_PATHS`). The payload carries no key material, no chat or
-memory text, not even the DB path. `sync.resources` are label enums (one is
-literally `api_keys`) and never values. Anything added here is readable by
+memory text, not even the DB path. Anything added to a section is readable by
 anything that can reach 127.0.0.1 on this box, by definition.
+
+AGENT METRICS (`GET /api/metrics`) — Task 27
+───────────────────────────────────────────
+A separate endpoint on purpose: health answers "is it working" and is what a
+monitor pages on; metrics answer "how fast, how often, how big". `metrics.report()`
+owns the arithmetic — see `agent2/core/metrics.py`.
 
 AUTHORIZATION (Task 14)
 ───────────────────────
@@ -52,7 +48,8 @@ class of bug the single `before_request` makes impossible. A route that must be
 reachable anonymously belongs in `auth.PUBLIC_PATHS` or `auth.LOOPBACK_PATHS`,
 where the exception is visible in one list instead of absent from one decorator.
 
-(test_health.py — 14 tests, sabotage-verified · test_webauth.py)
+(test_health.py — 58 tests, sabotage-verified · test_metrics.py — 59 tests
+ · test_webauth.py)
 """
 
 from flask import request, jsonify
@@ -71,6 +68,8 @@ from agent2.core import workspace as core_workspace
 from agent2.core.session import sessions as core_sessions
 from agent2.core import tasks as core_tasks
 from agent2.core import recovery as core_recovery
+from agent2.core.recovery import crash as _crash
+from agent2.core import health as core_health
 from agent2.core import permissions as core_perms
 from agent2.llm import capabilities as core_caps
 from agent2.llm import router as core_router
@@ -129,6 +128,32 @@ def register_routes(app) -> None:
             d.get("model", DEFAULT_MODEL), d.get("mode", DEFAULT_MODE))
         return jsonify(chat)
 
+    @app.route("/api/chats/resume", methods=["GET"])
+    def api_resume_target():
+        """What a fresh tab would continue, and whether it will do so by itself.
+
+        ⚠️ Registered ABOVE `/api/chats/<cid>` and the static segment is what makes
+        it reachable — Werkzeug ranks a literal part over a converter, so
+        `/api/chats/resume` cannot be swallowed by the id route. That is behaviour
+        this endpoint *depends* on rather than merely benefits from, so it is
+        asserted (`test_continuity.py`) instead of assumed, and the browser treats
+        any non-payload answer as "nothing to continue" — losing the race would
+        cost the feature, never the page.
+
+        ⚠️ Identity and size only, never message text: `GET /api/chats/<cid>` is
+        the one reader of a transcript, and this is a probe the first paint makes
+        before anybody has chosen anything.
+
+        `resume` and `auto` are two different facts — *which* conversation, and
+        *whether* Agent2 opens it unasked (`AGENT2_RESUME`). A client that wants
+        the second question answered can read `auto` even when there is nothing
+        to continue.
+        """
+        return jsonify({
+            "auto":   core_context.auto_resume(),
+            "resume": core_context.resumable(),
+        })
+
     @app.route("/api/chats/<cid>/pause", methods=["POST"])
     def api_pause_chat(cid):
         core_context.pause_chat(cid)
@@ -145,7 +170,7 @@ def register_routes(app) -> None:
         if not chat:
             return jsonify({"error": "not found"}), 404
         chat["messages"] = qall(
-            "SELECT * FROM messages WHERE chat_id=? ORDER BY created_at", (cid,)
+            f"SELECT * FROM messages WHERE chat_id=? {core_context.MSG_ORDER}", (cid,)
         )
         return jsonify(chat)
 
@@ -176,13 +201,95 @@ def register_routes(app) -> None:
 
     @app.route("/api/recovery", methods=["GET"])
     def api_recovery():
-        """Interrupted task sessions for this project, newest first."""
+        """Both halves of recovery in one payload.
+
+        `candidates` is Task 3's interrupted **task sessions** — work a human may
+        choose to resume. `crash` is Phase 8's automatic recovery: what the startup
+        scan found, what it decided, and what is waiting for review.
+
+        ⚠️ **ONE ENDPOINT, TWO HALVES — NOT TWO ENDPOINTS.** They answer the same
+        question ("is there unfinished work from a previous run") and a panel that had
+        to poll two paths to render one section is how the browser ends up showing a
+        session as resumable while the crash ledger has already marked its command
+        `needs_review`. `candidates` keeps its exact old shape and position, because
+        `public/script.js` reads it.
+        """
         try:
             cwd = str(core_workspace.root())
         except Exception:
             cwd = ""
-        return jsonify({"candidates": [c.to_dict()
-                                       for c in core_recovery.candidates(cwd)]})
+        out = {"candidates": [c.to_dict() for c in core_recovery.candidates(cwd)]}
+        try:
+            out["crash"] = _crash.report()
+        except Exception as ex:   # a reporting failure may not cost the caller Task 3's half
+            out["crash"] = {"error": f"{type(ex).__name__}: {ex}"}
+        return jsonify(out)
+
+    # ⚠️ THESE TWO STATIC PATHS SIT IN FRONT OF `/api/recovery/<sid>` ON PURPOSE, and
+    # Werkzeug's rule sorting — static segments before converters — is what makes that
+    # safe. A session id is 12 hex characters, so `scan`/`units` can never *be* one;
+    # the risk was only ever the routing, and `test_crashrecovery` pins it by asking
+    # for `/api/recovery/scan` and asserting it did not land in the plan handler.
+
+    @app.route("/api/recovery/scan", methods=["POST"])
+    def api_recovery_scan():
+        """Run a recovery scan now. `{"project": "*"}` widens it past this project.
+
+        POST because it writes: it settles ledger rows and moves recovery records.
+        Bounded by the same `limit`/`budget` ceilings the startup scan uses, so a
+        caller cannot turn this into an unbounded table walk.
+        """
+        body = request.json or {}
+        kw: dict = {}
+        if body.get("project"):
+            kw["project"] = str(body["project"])
+        for name, cast in (("stale_after", float), ("limit", int), ("budget", float)):
+            if body.get(name) is not None:
+                try:
+                    kw[name] = cast(body[name])
+                except (TypeError, ValueError):
+                    return jsonify({"error": f"{name} must be a number"}), 400
+        return jsonify(_crash.scan(**kw))
+
+    @app.route("/api/recovery/units", methods=["GET"])
+    def api_recovery_units():
+        """Recovery records — `?state=needs_review` for just the review queue.
+
+        ⚠️ Never carries a command line, an argument dict or file content: the payload
+        is `crash._payload()`'s, which joins none of the unit's own text in. See its
+        docstring — `run_command` argv routinely holds a bearer token.
+        """
+        state = str(request.args.get("state") or "").strip()
+        project = request.args.get("project") or None
+        try:
+            limit = int(request.args.get("limit") or 50)
+        except ValueError:
+            return jsonify({"error": "limit must be a number"}), 400
+        return jsonify({"units": _crash.rows(project=project, status=state,
+                                             limit=limit),
+                        "counters": _crash.counters()})
+
+    @app.route("/api/recovery/units/<kind>/<ref_id>", methods=["POST"])
+    def api_recovery_unit_act(kind, ref_id):
+        """`{"action": "acknowledge"|"retry"|"terminate"}` on one recovery record.
+
+        ⚠️ **`retry` AND `terminate` STILL ASK `core.permissions`** — inside
+        `crash.retry()` / `crash.terminate()`, live, not here. An operator overrules
+        the *verdict* recovery could not establish, never the capability gate; the
+        alternative is a button that launders `AGENT2_DENY_CAPS` away.
+        """
+        action = str((request.json or {}).get("action") or "").strip().lower()
+        note = str((request.json or {}).get("note") or "")
+        if action == "acknowledge":
+            res = _crash.acknowledge(kind, ref_id, note)
+        elif action == "retry":
+            res = _crash.retry(kind, ref_id)
+        elif action == "terminate":
+            res = _crash.terminate(kind, ref_id)
+        else:
+            return jsonify({"error": "action must be 'acknowledge', 'retry' or "
+                                     "'terminate'"}), 400
+        return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.route("/api/recovery/<sid>", methods=["GET"])
     def api_recovery_plan(sid):
@@ -724,114 +831,60 @@ def register_routes(app) -> None:
 
     # ── Health ─────────────────────────────────────────────────────────────────
 
-    def _section(fn):
-        """Collect one health section without letting it fail the whole report.
-
-        ⚠️ A health endpoint that 500s because one counter raised is worse than no
-        health endpoint: the monitor now reports the app down when the only broken
-        thing is the reporting. Each section degrades to its own error string.
-        """
-        try:
-            return fn(), None
-        except Exception as ex:
-            return None, f"{type(ex).__name__}: {ex}"
-
-    def mcp_health_report():
-        """The `mcp` health section (Task 10).
-
-        ⚠️ IT ONLY FETCHES. Every judgement — which states count as a fault, what
-        each one is called — belongs to `registry.health_report()`, because the CLI
-        and the settings panel render the same verdict and a second copy here would
-        be the third. An import failure is not a fault either: a build without the
-        `mcp` package has no servers to be unhealthy about.
-        """
-        try:
-            from agent2.integrations import registry as mcp_registry
-        except Exception:
-            return {"servers": [], "total": 0, "connected": 0,
-                    "enabled": 0, "failing": 0, "problems": []}
-        return mcp_registry.health_report()
-
     @app.route("/api/health", methods=["GET"])
     def api_health():
-        """Aggregate health snapshot: DB, pool, WAL, scheduler, sync poller, MCP.
+        """Aggregate health snapshot — Task 28's fourteen subsystems in one payload.
 
-        Built for monitoring, `agent2 status`, and the settings UI. There is no
-        auth on this or any other route (the documented gap), so it reports
-        COUNTERS ONLY — no keys, no chat content, no memory text, not even the DB
-        path.
+        `agent` · `db` · `pool` · `wal` · `scheduler` · `tasks` · `commands` ·
+        `sync` · `recovery` · `mcp` · `memory` · `context` · `providers` ·
+        `permissions`, plus `sections` (the per-subsystem `✓/⚠/✗/○` verdict list),
+        `ok`, `problems` and `warnings`.
 
-        ⚠️ A disabled optimization is NOT unhealthy. The WAL checkpointer and the
-        turn scheduler are both documented as optimizations layered over working
-        defaults, and both can be switched off on purpose
-        (`AGENT2_WAL_CHECKPOINT_SEC=0`, `AGENT2_MAX_CONCURRENT_TURNS=0`). Reporting
-        "degraded" for those would make the endpoint cry wolf, and an alert that
-        fires on a supported configuration is an alert people learn to ignore.
-        Only genuine faults set `ok: false`.
+        ⚠️ THE REPORT ITSELF LIVES IN `core/health.py`, AND THIS IS THE WHOLE
+        ROUTE. Task 28 asks for the verdict list on the CLI too, and the CLI has no
+        Flask app to call — so the sections, the fault rules and the ✓/⚠ mapping
+        moved to `core/` (where `integrations.registry.health()` already lives, for
+        the same reason). Leaving them here would have meant a second `if` ladder in
+        `agent2cli.py` that agreed with this endpoint on the day it was written and
+        drifted silently afterwards, each half looking correct alone.
 
-        ⚠️ Task 10 applies that same rule to MCP, where it bites hardest: BOTH
-        bridges ship auto-connect OFF, so on a fresh install every server is
-        disconnected and the endpoint must still return 200. Only a server the
-        user ENABLED and that we know is not working is a fault — the verdict is
-        `registry.health()`'s to make, not this route's (see its docstring).
+        ⚠️ Task 28's instruction was *"reuse the existing endpoint rather than
+        creating a duplicate"*, and that is why every subsystem lands here rather
+        than behind a second `/api/status`: two aggregate endpoints means one of
+        them is the stale one, and nothing in the payload says which.
+
+        ⚠️ `ok` AND THE STATUS CODE ARE DECIDED BY `problems` ALONE — see
+        `core.health.report()`, which states why `warnings` may never influence
+        either. 503 so a monitor can act on the status line without parsing the
+        body; the full body is still returned, so whatever is wrong is visible.
         """
-        import agent2.database as db
-        from agent2.core import scheduler, sync
+        body = core_health.report()
+        return jsonify(body), (200 if body["ok"] else 503)
 
-        out, problems = {}, []
+    # ── Agent metrics (Task 27) ────────────────────────────────────────────────
 
-        # The DB is the one hard dependency: everything else is a counter about
-        # it. A failing round-trip is the only thing that makes this app "down".
-        def _db_probe():
-            row = db.qone("SELECT 1 AS ok")
-            return {"reachable": bool(row and row.get("ok") == 1),
-                    "schema_version": db.schema_version(),
-                    "schema_expected": db.SCHEMA_VERSION}
+    @app.route("/api/metrics", methods=["GET"])
+    def api_metrics():
+        """Everything Task 27 measures: the thirteen signals, in one payload.
 
-        for name, fn in (("db", _db_probe),
-                         ("pool", db.pool_stats),
-                         ("wal", db.wal_stats),
-                         ("scheduler", scheduler.stats),
-                         ("sync", sync.stats),
-                         ("mcp", mcp_health_report)):
-            data, err = _section(fn)
-            out[name] = data if err is None else {"error": err}
-            if err is not None:
-                problems.append(f"{name}: {err}")
+        ⚠️ THIS IS NOT A SECOND `/api/health`. Health answers "is it working" and
+        is what a monitor pages on; this answers "how fast, how often, how big" and
+        is what a human reads while tuning. Folding the series into the health
+        payload would have made the endpoint an unauthenticated performance dump
+        and — worse — would have put latency numbers next to a 503, inviting a
+        monitor to alert on a percentile.
 
-        dbi = out.get("db") or {}
-        if not dbi.get("reachable"):
-            problems.append("database unreachable")
-        elif dbi.get("schema_version") != dbi.get("schema_expected"):
-            # A wrong schema resurfaces later as a baffling error in an unrelated
-            # feature, which is exactly why migrations re-raise rather than
-            # degrade. Surface it here too.
-            problems.append(
-                f"schema at v{dbi.get('schema_version')}, "
-                f"expected v{dbi.get('schema_expected')}")
+        ⚠️ IT REPORTS, IT DOES NOT MEASURE. `metrics.report()` owns the arithmetic,
+        and three of the thirteen signals are *borrowed* from the readers that
+        already own them (`router.stats()` for LLM latency and errors,
+        `permissions.counters()` for denials) rather than re-observed here — two
+        windows over one fact disagree numerically and both look right.
 
-        sch = out.get("scheduler") or {}
-        # ⚠️ NOT "enabled but workers == 0" — the pool starts its workers lazily on
-        # the first submit(), so that is the normal state of an idle server and the
-        # check fired on a perfectly healthy app. The real fault is workers that
-        # started and then went away: capacity lost, so submitted turns would sit
-        # in the queue forever.
-        if sch.get("worker_starts") and not sch.get("workers"):
-            problems.append("scheduler workers died — queued turns cannot run")
-        if sch.get("queued") and sch.get("queued") >= sch.get("max_queue", 0):
-            problems.append("turn queue full — new turns are being rejected")
-
-        # Task 10: the section already decided which servers are faults and worded
-        # each line; this only lifts them into the aggregate so `ok`/503 covers MCP
-        # too. ⚠️ It reads `problems`, NOT `failing` — re-deriving the sentence here
-        # would be the second place that describes a broken bridge.
-        problems.extend((out.get("mcp") or {}).get("problems", []))
-
-        out["ok"] = not problems
-        out["problems"] = problems
-        # 503 so a monitor can act on the status line alone, without parsing the
-        # body. Still returns the full body, so whatever is wrong is visible.
-        return jsonify(out), (200 if out["ok"] else 503)
+        No content ever enters this payload: a label is a tool name, a model key, a
+        status word or a source name, never an argument, a command line or a prompt.
+        """
+        from agent2.core import metrics
+        return jsonify(metrics.report())
 
     # ── Model capability registry + routing + fallback (Tasks 17, 18, 19) ──────
     # ⚠️ ONE ROUTE SET FOR ALL THREE, because they are one subject from a
@@ -981,8 +1034,449 @@ def register_routes(app) -> None:
         ws = core_workspace.set_workspace(path)
         return jsonify(ws.as_dict())
 
-    # ── Background tasks (section 7) ───────────────────────────────────────────
+    # ── The project doc — `/init` for the browser (Tasks 29–31) ────────────────
+    # ⚠️ TWO ROUTES, ONE ENGINE. `core.projectscan` decides what is true about this
+    # project and `core.projectdoc` writes it; both surfaces call exactly those two,
+    # so the terminal's `/init` and the browser's button cannot describe the same
+    # tree differently. A "web version" that re-derived any of it would be a second
+    # declaration of what a project IS — and its drift would be *committed to a
+    # file* that every later turn then reads as fact.
 
+    @app.route("/api/project", methods=["GET"])
+    def api_get_project():
+        """What `/init` would find, and what it has already written.
+
+        Read-only: it scans, it never creates `.agent2/`. `doc` reports the file's
+        own state (`exists`, `bytes`, `sections`, `generated`, `hint`) so a panel
+        can say "3 sections are yours" before offering to refresh anything.
+
+        ⚠️ It reports section HEADINGS and who owns them, never their text. The
+        user's own `## Agent2 Instructions` is theirs, and an endpoint that returns
+        it turns a project doc into one more place a stray reader finds prose the
+        author expected to live only in their checkout.
+        """
+        from agent2.core import broker as _broker
+        from agent2.core import projectdoc, projectscan
+        rep = projectscan.scan()
+        root = rep.get("root") or ""
+        doc = {"exists": False, "path": _broker.PRIMARY_DOC, "bytes": 0,
+               "sections": [], "generated": [], "preserved": [], "hint": ""}
+        if root:
+            existing = projectdoc.read_existing(root)
+            if existing:
+                _pre, blocks = projectdoc.parse(existing)
+                doc.update({
+                    "exists": True,
+                    "bytes": len(existing.encode("utf-8", "replace")),
+                    "sections": [b.heading for b in blocks],
+                    "generated": [b.heading for b in blocks if b.generated],
+                    "preserved": [b.heading for b in blocks if not b.generated],
+                    "hint": projectdoc.prior_hint(existing),
+                })
+        return jsonify({"scan": rep, "doc": doc})
+
+    @app.route("/api/project/init", methods=["POST"])
+    def api_project_init():
+        """Run `/init`: scan the workspace, then create or update `.agent2/agent2.md`.
+
+        Body: `hint` (the user's own one-line description — the thing a scan can
+        never learn), `describe` (default true; false skips the model call), and
+        `write` (default true; false is a DRY RUN that performs the whole merge and
+        reports what *would* change, touching nothing).
+
+        ⚠️ POST because it writes, and the write is `projectdoc.apply()`'s alone —
+        it re-asks `core.permissions` for `fs.write`, refuses a `.agent2` that would
+        be the per-machine key folder, and preserves every section a human owns.
+        A refusal is a `reason` in a 200 body with `ok: false`, not a 500: the
+        caller asked a legitimate question and the answer is "not here".
+        """
+        from agent2.core import projectdoc, projectscan
+        d = request.json or {}
+        rep = projectscan.scan()
+        res = projectdoc.apply(
+            rep,
+            hint=str(d.get("hint") or "").strip(),
+            describe=bool(d.get("describe", True)),
+            write=bool(d.get("write", True)),
+        )
+        return jsonify({"scan": rep, "result": res})
+
+    # ── Skills (Phase 11, Tasks 32–36) ─────────────────────────────────────────
+    # ⚠️ THE BROWSER GETS THE SAME THREE READS AND THE SAME ONE WRITE THE TERMINAL
+    # GETS, out of the same functions. `/skills` in the CLI and this panel are two
+    # renderers over `Catalog.to_payload()`, `Selection.to_payload()` and
+    # `skills.describe()`; the write is `state.set_many()` / `skills.toggle()`. A
+    # "web version" of any of it would be a second answer to *which skills does this
+    # project have, and which ones fired* — and the browser's would be the one
+    # nobody was watching while the terminal looked right.
+    #
+    # ⚠️ NO ROUTE HERE TOUCHES A SKILL FILE, ever — Task 33's constraint. Enablement
+    # is a `skill_state` row keyed by project, so the same folder shared between two
+    # checkouts carries no choices with it.
+
+    @app.route("/api/skills", methods=["GET"])
+    def api_get_skills():
+        """This project's skills, the user's choices, and the last selection.
+
+        `?force=1` bypasses the discovery TTL (what `/skills reload` does).
+        ⚠️ Metadata only — `Skill.to_payload()` defaults `body=False` and this never
+        overrides it, for the reason `GET /api/project` refuses section bodies: a
+        skill is prose a human wrote in their own checkout.
+        """
+        from agent2.core import skills as _skills
+        force = str(request.args.get("force") or "").strip().lower() in ("1", "true", "yes")
+        cat = _skills.available(force=force)
+        return jsonify({
+            "catalog": cat.to_payload(),
+            "states": _skills.state.states(),
+            "last": _skills.last_applied(),
+            "policy": _skills.describe(),
+            "stats": _skills.stats(),
+        })
+
+    @app.route("/api/skills/<sid>", methods=["PUT"])
+    def api_set_skill(sid):
+        """Turn one skill on / off / back to automatic.
+
+        Body: `{"enabled": true | false | null}`. ⚠️ `null` IS A REAL VALUE and is
+        not the same as `false` — it clears the row, restoring *automatic* selection
+        (the skill still applies when the request names it or its keywords match).
+        A body with no `enabled` key is a `400`, because "absent" and "null" would
+        otherwise be the same request with two different meanings.
+        """
+        from agent2.core import skills as _skills
+        d = request.json or {}
+        if "enabled" not in d:
+            return jsonify({"error": "enabled is required (true, false or null)"}), 400
+        val = d.get("enabled")
+        if val is not None and not isinstance(val, bool):
+            return jsonify({"error": "enabled must be true, false or null"}), 400
+        ok, msg = _skills.toggle(str(sid), val)
+        return jsonify({"ok": ok, "message": msg}), (200 if ok else 404)
+
+    @app.route("/api/skills", methods=["PUT"])
+    def api_set_skills():
+        """Bulk set, for the panel's Apply button. Body: `{"states": {id: bool|null}}`.
+
+        ⚠️ ONE WRITE, not N — `state.set_many()` exists for this, and the reason is
+        in its docstring: N round trips is N `sync.notify()`s and, in dual mode, N
+        chances for the other process to read a half-applied selection. The CLI's
+        `/skills` menu goes through the same function.
+        """
+        from agent2.core import skills as _skills
+        d = request.json or {}
+        raw = d.get("states")
+        if not isinstance(raw, dict):
+            return jsonify({"error": "states must be an object of {skill_id: true|false|null}"}), 400
+        changes: dict[str, bool | None] = {}
+        for key, val in raw.items():
+            if val is not None and not isinstance(val, bool):
+                return jsonify({"error": f"states[{key}] must be true, false or null"}), 400
+            changes[str(key)] = val
+        written = _skills.state.set_many(changes)
+        return jsonify({"ok": True, "written": written,
+                        "states": _skills.state.states()})
+
+    # ── Workflows (Phase 12, Tasks 37–39) ──────────────────────────────────────
+    # ⚠️ THE BROWSER GETS THE SAME FOUR VERBS THE TERMINAL GETS — new · edit ·
+    # run · delete — out of the same two modules. `/workflow` in the CLI and these
+    # routes are two renderers over `Catalog.to_payload()`, `WorkflowFile.to_payload()`
+    # and `RunState.to_payload()`; the writes are `authoring.create/delete()` and
+    # `runner.instantiate()`. A "web version" of any of it would be a second answer
+    # to *what workflows does this project have and which one is running*.
+    #
+    # ⚠️ NO ROUTE HERE VALIDATES A NAME, BUILDS A PATH OR PRE-CHECKS A CAPABILITY.
+    # `authoring` asks `fs.write`/`fs.delete` live and `runner.instantiate()` asks
+    # `chat` live, and each refuses by *returning* a reason — so a refusal is
+    # `{"ok": false, "reason": …}` inside a 200 rather than a 500, and the gate has
+    # exactly one home. A pre-check here is a second gate that drifts permissive.
+    #
+    # ⚠️ `edit` is deliberately NOT a route. The CLI's `[E]dit` launches
+    # `$VISUAL`/`$EDITOR` on the machine running the terminal; a browser tab may be
+    # on another machine entirely, so the web half edits by POSTing `body` — which
+    # goes through the same `loader.build()` validation the file would get on the
+    # next read. Spawning a server-side editor for a remote click is not the same
+    # feature under a shared name.
+
+    @app.route("/api/workflows", methods=["GET"])
+    def api_get_workflows():
+        """This project's workflow files, the live run, and the subsystem's posture.
+
+        `?force=1` bypasses the discovery TTL (what `/workflow reload` does).
+        ⚠️ The catalog lists every file INCLUDING the ones that will not run — a
+        workflow that is absent from the list because it is broken is indistinguishable
+        from one nobody wrote, and the second is not fixable. `problems` says why.
+
+        `?verify=1` adds `verification` — `core.verify`'s five-verdict report on the run
+        this payload already describes, which is the browser's half of the terminal's
+        *Execute → Verify → Complete*. ⚠️ **ASKED FOR, NEVER VOLUNTEERED, AND NOT A
+        SECOND ROUTE.** `runner.verify()` writes an audit line every time it runs and
+        reads two ledgers, and this endpoint is what a panel polls — so a poll may not
+        pay for it, and a verdict a nobody asked for may not fill the audit file. It is
+        `?force=1`'s shape for `?force=1`'s reason: one route answers one question, and
+        the caller says how much of the answer it wants.
+        """
+        from agent2.core import workflow as _wf
+        force = str(request.args.get("force") or "").strip().lower() in ("1", "true", "yes")
+        want = str(request.args.get("verify") or "").strip().lower() in ("1", "true", "yes")
+        cat = _wf.discover(force=force)
+        live = _wf.runner.live(chat_id=str(request.args.get("chat_id") or "").strip())
+        recent = _wf.runner.runs(limit=10)
+        out = {
+            "catalog": cat.to_payload(),
+            "live": live.to_payload() if live is not None else {},
+            "runs": recent,
+            "policy": _wf.describe(),
+        }
+        if want:
+            # The live run when there is one, else the newest recorded — the same run
+            # `live`/`runs[0]` already names, so a reader never has to guess which one
+            # a verdict belongs to. `ref` on the report says it outright.
+            rid = (live.run_id if live is not None
+                   else str((recent[0] or {}).get("id") or "") if recent else "")
+            out["verification"] = (_wf.verify(rid, state=live).to_payload()
+                                   if rid else {})
+        return jsonify(out)
+
+    @app.route("/api/workflows/<name>", methods=["GET"])
+    def api_get_workflow(name):
+        """One workflow as Agent2 understood it — nodes, order, problems.
+
+        404 names how many workflows ARE known, because "not found" and "you have
+        none" send a caller to two different places.
+        """
+        from agent2.core import workflow as _wf
+        wf = _wf.load(str(name))
+        if wf is None:
+            cat = _wf.discover()
+            return jsonify({"error": f"no single workflow matches {name!r}",
+                            "known": [f.name for f in cat.files]}), 404
+        return jsonify(wf.to_payload(nodes=True))
+
+    @app.route("/api/workflows", methods=["POST"])
+    def api_create_workflow():
+        """Write a new workflow file. Body: `name`, `description`, `fmt`, `body`.
+
+        ⚠️ It never overwrites — `existed: true` comes back and the caller edits
+        instead, because the file is the only copy of a plan somebody wrote.
+        ⚠️ `ok` and `runnable` are TWO facts: a supplied `body` can be saved
+        successfully and still not form a graph the runner would accept, and
+        reporting only the write would let a panel say "created" about a file that
+        cannot run. `problems` is the difference.
+        """
+        from agent2.core.workflow import authoring
+        d = request.json or {}
+        name = str(d.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        res = authoring.create(
+            name,
+            description=str(d.get("description") or "").strip(),
+            fmt=str(d.get("fmt") or "yaml").strip().lower() or "yaml",
+            body=str(d.get("body") or ""),
+        )
+        return jsonify(res.to_payload())
+
+    @app.route("/api/workflows/auto", methods=["POST"])
+    def api_auto_workflow():
+        """Plan a graph from a goal — Task D4.31, the browser's `/workflow auto`.
+
+        Body: `goal` (required), `mode` (`plan` default · `auto`), `chat_id`, `model`,
+        `mode_key`.
+
+        ⚠️ **`plan` IS THE DEFAULT AND `auto` MUST BE ASKED FOR BY NAME.** D4.31's bar
+        is *"explicit activation; never automatic for a normal prompt"*, and a default
+        of `auto` would make a panel that forgot the field create task rows. The two
+        modes are `dynamic.MODES`, and an unrecognised word is refused by `dynamic`
+        with `X_BAD_MODE` rather than coerced — `AGENT2_WEB_ROLE`'s direction: a typo
+        falls to the side that changes nothing.
+        ⚠️ **PLAN WRITES NOTHING AT ALL** — no `exec_workflows` row, no `agent_tasks`
+        row — so this is the one workflow POST that is safe to call to *look*.
+        ⚠️ **A refusal is `{"ok": false, "reason": …}` INSIDE A 200**, this section's
+        rule: `dynamic` declines by returning a `Draft`, and the panel branches on
+        `r.ok`. It pre-checks nothing — `runner.instantiate()` asks `chat` live on the
+        `auto` path, and this route is covered by the one `("/api/workflows", "",
+        CAP_CHAT)` permission entry by prefix.
+        ⚠️ It is reachable only because Werkzeug ranks a literal segment above a
+        converter; there is no `POST /api/workflows/<name>`, so nothing is shadowed.
+        """
+        from agent2.core.workflow import dynamic
+        d = request.json or {}
+        goal = str(d.get("goal") or "").strip()
+        if not goal:
+            return jsonify({"error": "goal is required"}), 400
+        draft = dynamic.start(
+            goal,
+            mode=str(d.get("mode") or dynamic.MODE_PLAN).strip().lower(),
+            chat_id=str(d.get("chat_id") or "").strip(),
+            model=str(d.get("model") or "").strip(),
+            mode_key=str(d.get("mode_key") or "").strip(),
+        )
+        return jsonify(draft.to_payload())
+
+    @app.route("/api/workflows/<name>", methods=["DELETE"])
+    def api_delete_workflow(name):
+        """Remove one workflow file. `fs.delete`, asked live inside `authoring`.
+
+        The confirmation belongs to the surface — the CLI asks twice — so this
+        performs what it is told and reports it.
+        """
+        from agent2.core.workflow import authoring
+        res = authoring.delete(str(name))
+        return jsonify(res.to_payload()), (200 if res.ok else 400)
+
+    @app.route("/api/workflows/<name>/run", methods=["POST"])
+    def api_run_workflow(name):
+        """Start a workflow: `runner.instantiate()`, which asks `chat` live.
+
+        Body: `chat_id`, `model`, `mode`. ⚠️ It refuses while a run is still live in
+        this project, for the reason `/workflow run` does: two live runs make
+        `for_turn()`'s "the current node" ambiguous, and the turn would be told to
+        work on one of them with no way to say which.
+        """
+        from agent2.core import workflow as _wf
+        d = request.json or {}
+        wf = _wf.load(str(name))
+        if wf is None:
+            return jsonify({"ok": False, "reason": f"no single workflow matches {name!r}"}), 404
+        if wf.defn is None or not wf.ok:
+            return jsonify({"ok": False, "reason": f"{wf.name} will not run as written",
+                            "workflow": wf.to_payload()}), 400
+        chat_id = str(d.get("chat_id") or "").strip()
+        busy = _wf.runner.live(chat_id=chat_id)
+        if busy is not None and not busy.finished:
+            return jsonify({"ok": False,
+                            "reason": f"{busy.name} is already running "
+                                      f"({busy.done}/{busy.total} settled)",
+                            "live": busy.to_payload()}), 409
+        run = _wf.instantiate(wf.defn, chat_id=chat_id,
+                              model=str(d.get("model") or "").strip(),
+                              mode=str(d.get("mode") or "").strip())
+        if not run.ok:
+            return jsonify({"ok": False, "reason": run.reason,
+                            "validation": run.validation.to_payload()
+                            if run.validation is not None else {}}), 400
+        return jsonify({"ok": True, "run": _wf.state_for(run.run_id).to_payload()})
+
+    # ── UltraCode (Phase D5) ───────────────────────────────────────────────────
+    # ⚠️ **THE SECOND OF EXACTLY TWO DOORS.** `config.py`'s UltraCode block says
+    # `/ultracode` and `POST /api/ultracode` are the only ways in, *asserted
+    # structurally* — so no other route may grow an UltraCode verb, and nothing on
+    # the turn path may import `core.ultracode` at all. A loop that writes code is
+    # entered on purpose, by a human, on one of two surfaces or on neither.
+    @app.route("/api/ultracode", methods=["GET"])
+    def api_ultracode_state():
+        """The read half — `/ultracode state` and `/ultracode policy` in one payload.
+
+        `?run_id=` reports that run; omitted, it reports whichever UltraCode run is
+        live here. One call rather than two, because `engine.state()` already carries
+        `policy` (`describe()`): the terminal prints them as two commands because a
+        human reads two paragraphs, and that is presentation.
+
+        ⚠️ **`ok` IS ONLY THE MASTER SWITCH** — it stays `true` with `run: null`, so
+        "nothing is live" is `run` and nowhere else. `_uc_state()` carries the same
+        warning for the same reason: conflating them prints *UltraCode is off* at a
+        project that merely has nothing running.
+        ⚠️ **`mine` IS THE ENGINE'S ANSWER** to *is this run UltraCode's* — it
+        filters on `plan.DEF_SOURCE`, while `start()`'s liveness check does not (two
+        questions, so two readers). A panel that re-derived it from `run.source`
+        would be the second declaration of what an UltraCode run **is**.
+        """
+        from agent2.core import ultracode as _uc
+        return jsonify(_uc.state(str(request.args.get("run_id") or "").strip()))
+
+    @app.route("/api/ultracode", methods=["POST"])
+    def api_ultracode():
+        """Drive the adaptive loop: `action` is `start` · `approve` · `cancel`.
+
+        `start` takes `goal` (required) plus `chat_id`, `model`, `mode_key`;
+        `approve` and `cancel` take `run_id` (omitted ⇒ the live run), and `cancel`
+        also takes a free-text `reason` for the record.
+
+        ⚠️ **`run` IS DELIBERATELY NOT A VERB HERE, AND `/ultracode run` IS WHERE IT
+        WENT** (rule 28 — name it, never silently omit it). Three reasons, and the
+        third is why nothing is lost: `engine.drive()` needs a synchronous worker
+        that owns a whole model turn, and the CLI's is `agent_turn` under
+        `limits(max_workers=0)` because ONE mutable `history` list cannot be appended
+        to by four threads — on this surface a turn is a Socket.IO stream owned by
+        `core/scheduler.py` and addressed to a `sid`, which a request thread has not
+        got. Driving the loop inside one request would then hold that request open
+        for an entire autonomous run — `ULTRACODE_BUDGET_SEC` is **off** by default —
+        with no stream, no heartbeat and no Stop. And it is unnecessary:
+        `workflow.for_turn()` does **not** filter on source, so an UltraCode run's
+        current node reaches the next browser turn's prompt exactly as a workflow
+        node does after `POST /api/workflows/<name>/run`. This is `edit`'s posture in
+        the section above, for a sharper reason.
+        ⚠️ **`work`, `replan` AND `finalize` ARE NOT VERBS ON EITHER SURFACE** —
+        `engine.drive()` owns all three and owns the ORDER they run in, which is the
+        whole of D5's loop.
+        ⚠️ **NEITHER DOOR PASSES `approval`, `force` OR `name`.** They are
+        `start()`'s parameters and the terminal declines them too: approval is the
+        operator's posture (`AGENT2_ULTRACODE_APPROVAL`), and a gate a JSON field
+        could switch off is not a gate.
+        ⚠️ **A refusal is `{"ok": false, "reason": …}` INSIDE A 200**, this section's
+        rule — every engine entry point declines by *returning* one of `REFUSALS`,
+        and it pre-checks nothing (`start()` asks the planner, the graph validator
+        and the live-run test itself). The `400`s are the two things the engine was
+        never asked: an action it has no verb for, and a `start` with no goal —
+        `api_auto_workflow`'s split, where an empty `goal` carries `{"error": …}` and
+        no `reason` at all because there is nothing to refuse yet.
+        ⚠️ **A SUCCESSFUL `cancel` HAS `ok: false`** — `Finish.ok` answers *did this
+        run do its job*, and a cancelled one did not. The cancel took effect when
+        `reason` is `cancelled` (`schedule.R_CANCELLED`), which is the one case where
+        that field is a verdict rather than a refusal.
+        """
+        from agent2.core import ultracode as _uc
+        d = request.json or {}
+        action = str(d.get("action") or "").strip().lower()
+
+        if action == "start":
+            goal = str(d.get("goal") or "").strip()
+            if not goal:
+                return jsonify({"error": "goal is required"}), 400
+            return jsonify(_uc.start(
+                goal,
+                chat_id=str(d.get("chat_id") or "").strip(),
+                model=str(d.get("model") or "").strip(),
+                mode_key=str(d.get("mode_key") or "").strip(),
+            ).to_payload())
+
+        if action in ("approve", "cancel"):
+            # ⚠️ WHICH RUN A VERB ACTS ON IS ASKED OF `state()`, the owner — the web
+            # half of `_uc_run_id()`. Both surfaces resolve an omitted id to the live
+            # run and both refuse one that is not OURS, because `dag.store.live()`
+            # is unfiltered by source and `cancel()` settles any graph run by id: a
+            # door that let a `/workflow auto` run be cancelled as UltraCode would be
+            # wider than the terminal's, which is the worse direction to drift. The
+            # facts (`ok`, `run`, `mine`) are the engine's; only the prose is ours.
+            snap = _uc.state(str(d.get("run_id") or "").strip())
+            run = snap.get("run") or {}
+            if not snap.get("ok"):
+                return jsonify({"ok": False, "reason": snap.get("reason") or "ultracode is off"})
+            if not run:
+                return jsonify({"ok": False, "reason": "no UltraCode run is live in this project"})
+            if not snap.get("mine"):
+                return jsonify({"ok": False,
+                                "reason": f"that run came from "
+                                          f"{run.get('source') or 'another surface'!r}, "
+                                          f"not UltraCode",
+                                "run": run})
+            rid = str(run.get("run_id") or "")
+            if action == "approve":
+                return jsonify(_uc.approve(rid).to_payload())
+            return jsonify(_uc.cancel(
+                rid, reason=str(d.get("reason") or "cancelled from the web UI"),
+            ).to_payload())
+
+        return jsonify({
+            "error": f"unknown action {action!r}" if action else "action is required",
+            "actions": ["start", "approve", "cancel"],
+            "read": "GET /api/ultracode reports the run, the stage and the policy",
+            "run": "terminal only — `/ultracode run` works the nodes; on this "
+                   "surface the next chat turn does, through workflow.for_turn()",
+        }), 400
+
+    # ── Background tasks (section 7) ───────────────────────────────────────────
     @app.route("/api/tasks", methods=["GET"])
     def api_list_tasks():
         return jsonify([

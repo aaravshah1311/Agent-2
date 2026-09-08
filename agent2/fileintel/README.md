@@ -255,6 +255,14 @@ because either one can create a file; the other three are reads. The gate lives
 in `tools.dispatch_tool` and returns a tool `error`, never an exception — the
 model reads errors and adapts.
 
+⚠️ **Those 8 categories cover 71 formats, and the registry above holds operations
+for 69 — both numbers are right and neither is a typo for the other.** **71** is
+what `detector.CATEGORY_FORMATS` *recognises*; **69** is what
+`REGISTRY.known_formats()` has an operation table for. Two formats are therefore
+identified, reported and have nothing to run. Do not "correct" the smaller figure
+into the larger one: if you find them disagreeing, that is the subsystem, not a
+mistake in this document.
+
 **Progress streaming.** `ToolExecutor` accepts an `on_progress` callback, and
 every operation emits human-readable steps ("Reading… / Converting… /
 Completed."). They are collected into the result's `progress` list, which
@@ -281,6 +289,27 @@ op-log `file_ops` row is the only record that it happened. Route a change throug
   (`UnsafePath`). The second check is not redundant: the public API is callable
   without the tool layer, and a check that only exists in a caller is a check a
   new caller forgets.
+- **The `options` dict carries paths too, and confining the subject path did not
+  confine those.** `options` is model-supplied, and several plugins write to a
+  path taken straight out of it — so `output_path`, `output_dir`, `other`,
+  `compare_to` and the `paths` list go through the same rule, in one place:
+  `security.confine_options(options, workspace_root)`, called by
+  `executor.run_operation()` after `preflight` and **before** `PluginContext` is
+  built (the context reads `options["output_dir"]`). A relative option resolves
+  against the *root*, never the process cwd, and with no root the call is a no-op
+  so the library stays usable unconfined.
+  ⚠️ **This shipped as a real escape**: `run_file_op` on an archive with
+  `options={"output_dir": "../outside"}` extracted outside the workspace, with no
+  error on either surface. Sabotage reproduced it live before the fix.
+  ⚠️ **The key list is one declaration** (`PATH_OPTIONS` / `PATH_LIST_OPTIONS`),
+  never a check inside whichever plugin honours a key — twelve plugins honouring
+  different keys is twelve places to forget one. A new writing option is confined
+  by adding a name to that tuple.
+  ⚠️ **And it is a backstop, not the only gate.** The tool layer still confines
+  first through `workspace.validate_path` (error code `outside_workspace`); this
+  is the library's own answer (`unsafe_path`), for the same reason `preflight` is
+  not redundant with `_safe_path`. The two error codes are how you tell which
+  layer caught it, and both are pinned.
 - **Size limit** — `config.MAX_FILE_SIZE` is enforced *before* any read
   (`FileTooLarge`), so a pathological file cannot be loaded into memory first and
   rejected second.

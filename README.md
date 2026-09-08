@@ -6,8 +6,6 @@ github: github.com/aaravshah1311
 
 <h1 align="center">⚡ Agent-2</h1>
 
-<h2 align="center">Stay Tuned, Massive, Powerfull Update Comming Soon</h2>
-
 <p align="center">
   <em>A self-hosted autonomous AI agent powered by Google Gemini —<br>
   coding assistant, terminal agent, security tester and persistent memory in one interface.</em>
@@ -18,14 +16,15 @@ github: github.com/aaravshah1311
   <img src="https://img.shields.io/badge/Flask-Web_UI-000000?style=for-the-badge&logo=flask&logoColor=white" />
   <img src="https://img.shields.io/badge/Gemini-6_models-4285F4?style=for-the-badge&logo=google&logoColor=white" />
   <img src="https://img.shields.io/badge/SQLite-single_file_state-003B57?style=for-the-badge&logo=sqlite&logoColor=white" />
-  <img src="https://img.shields.io/badge/Tests-1602-3ddc84?style=for-the-badge&logo=pytest&logoColor=white" />
+  <img src="https://img.shields.io/badge/Tests-2670-3ddc84?style=for-the-badge&logo=pytest&logoColor=white" />
+  <img src="https://img.shields.io/badge/Status-Active-3ddc84?style=for-the-badge" />
 </p>
 
 <p align="center">
   <a href="#-what-it-is">What it is</a> •
   <a href="#-quick-start">Quick start</a> •
   <a href="#-three-surfaces-one-brain">Surfaces</a> •
-  <a href="#-the-17-agent-tools">Tools</a> •
+  <a href="#-the-18-agent-tools">Tools</a> •
   <a href="#-models-and-modes">Models</a> •
   <a href="#-subsystems">Subsystems</a> •
   <a href="#-security-posture">Security</a> •
@@ -113,17 +112,17 @@ copy drifts silently — each surface still looks right on its own.
 
 ---
 
-## 🛠 The 17 agent tools
+## 🛠 The 18 agent tools
 
-**Core (12)** — `run_command`, `read_file`, `write_file`, `multi_edit_files`, `list_dir`,
+**Core (13)** — `run_command`, `read_file`, `write_file`, `multi_edit_files`, `list_dir`,
 `grep_search`, `delete_file`, `scan_project`, `web_search`, `update_todo`, `save_memory`,
-`emit_plan`
+`emit_plan`, `update_project_doc`
 
 **File Intelligence (5)** — `detect_file`, `file_capabilities`, `run_file_op`,
 `convert_file`, `search_workspace` — router-dispatched shims into `agent2.fileintel`, so
 backends are chosen internally.
 
-Sixteen of them go through `tools.dispatch_tool`. `run_command` alone goes through
+Seventeen of them go through `tools.dispatch_tool`. `run_command` alone goes through
 `terminal.stream_command`, which is why the exec capability gate is implemented twice on
 purpose — and why the CLI's copy sits *outside* the retry loop: a refusal must not become an
 allow on retry.
@@ -194,8 +193,19 @@ same Socket.IO events, stdlib `urllib` only.
 | **Ephemeral menus** | One `Application`, one `Window`, capped to the terminal and erased when done | `cli/palette.py` |
 | **Command execution** | Three registries — handles, execution state, pipe I/O — plus a watchdog that reports and never kills by default | `core/commands.py`, `core/procio.py` |
 | **Cancellation** | Ctrl+C stops the **command**, not the session. Record, then kill — that order is load-bearing | `cli/state.py`, `terminal.py` |
-| **Tasks & recovery** | Checkpointed long work that never re-runs what already finished | `core/tasks.py`, `core/recovery.py` |
+| **Tasks & recovery** | Checkpointed long work that never re-runs what already finished | `core/tasks.py`, `core/recovery/` |
 | **Scheduling** | Bounded worker pool. `submit()` returns `queued` / `disabled` / `rejected`, each with a required response | `core/scheduler.py` |
+| **DAG core** | What a graph, a node and an edge **are**, for every consumer. Nine node states, two of them derived on every read. No new table: a graph is one `exec_workflows` row plus N `agent_tasks` rows | `core/dag/` |
+| **DAG scheduler** | *Never blindly run every READY node.* One scheduler for every consumer, and every node it declines carries a reason | `core/dag/schedule.py` |
+| **Workflow** | A multi-step plan as a task graph — the first DAG consumer, not a second engine. Progress is re-derived from the rows, never read out of the run | `core/workflow/` |
+| **Workflow files** | `.agent2/workflows/*.yaml`, read by a declared stdlib parser subset. An older schema still runs; a truncated declaration is refused | `core/workflow/loader.py` |
+| **Dynamic Workflow** | A goal sentence becomes a graph. `plan` is the default and writes nothing; `auto` must be asked for by name | `core/workflow/dynamic.py` |
+| **UltraCode** | The autonomous loop — understand → inspect → discover skills → plan → execute → observe → analyze → verify → re-plan. The fourth DAG consumer. Two doors only, both explicit | `core/ultracode/` |
+| **Verification** | *"Done" is not verification.* Five verdicts drawn from the durable ledgers, because `agent_tasks.status` is written by the thing being judged | `core/verify.py` |
+| **Skills** | Instruction files in `.agent2/skills/`, selected **per request** in five tiers. Not every skill in every prompt — and no write API reaches the package | `core/skills/` |
+| **Project doc** | `/init` walks the project, reads what its own comments say about it, and writes `.agent2/agent2.md` — which every later prompt reads back as fact | `core/projectscan.py`, `core/projectdoc.py` |
+| **Health** | One assembly answers *is it working*, read by `/health` and `GET /api/health`. Fourteen sections, each a projection of the reader that owns the fact | `core/health.py` |
+| **Metrics** | Thirteen declared signals at the existing single-writer chokepoints. Three are **borrowed**, so the second drifting copy cannot appear | `core/metrics.py` |
 | **Cross-process sync** | `notify()` publishes in-process synchronously; `SyncPoller` republishes what another process changed | `core/sync.py` |
 | **Personal Intelligence** | Fully offline prediction, opt-in grammar, opt-in prompt enrichment. No network, no retraining | `core/pil/` |
 | **File Intelligence** | Detect, convert and operate on real file formats through one router and a plugin set | `fileintel/` |
@@ -275,7 +285,7 @@ truncated.
 
 All state is in `agent2.db` — never a `.env` file. `config.DB` is the one source of truth for
 its path. Environment variables cover only the decisions that must be made before the database
-is open; there are 61 of them, documented in full at
+is open; there are 116 of them, documented in full at
 [**Environment variables**](https://agent2.is-best.net/docs/env/). The ones most people set:
 
 | Variable | Default | Effect |
@@ -293,6 +303,20 @@ is open; there are 61 of them, documented in full at
 | `AGENT2_SECRET_KEY_FILE` | `~/.agent2/secret.key` | Master key location, deliberately outside the DB directory |
 | `BURP_MCP_URL` / `ZAP_MCP_URL` | `:9876` / `:8282` | MCP endpoints — the **fallback**; a stored `mcp_config` row wins |
 
+The graph family has its own ceilings, and every one of them is *reported* rather than silent:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `AGENT2_SKILLS` · `_IN_PROMPT` | `1` · `4` | Master switch for `.agent2/skills/` · how many skills may reach **one** prompt — the number *not every skill in every prompt* is measured against |
+| `AGENT2_WORKFLOWS` · `_MAX_NODES` | `1` · `64` | Master switch · nodes one workflow may declare. **Refused, never truncated** — a graph missing its last node is one whose dependencies no longer close |
+| `AGENT2_DAG_MAX_WORKERS` · `_MAX_RUNNING` | `4` · `8` | Threads the pump may use (`0` runs nodes inline, one at a time) · nodes in flight at once. Two numbers, because in-flight is derived from the rows and counts another process's claims too |
+| `AGENT2_DAG_MAX_MUTATIONS` · `_MAX_ATTEMPTS` | `64` · `2` | Nodes a **live** graph may gain · times one node may be started. `0` mutations is a supported answer: *plan once and never invent more work* |
+| `AGENT2_DYNAMIC_WORKFLOW` · `_MAX_ROUNDS` | `1` · `3` | Master switch for the **planner** · times one run may be re-planned. Turning the planner off does not stop workflow *files* running |
+| `AGENT2_ULTRACODE` · `_MAX_CYCLES` | `1` · `6` | Master switch for the autonomous driver · execute→verify→re-plan cycles one run may spend |
+| `AGENT2_ULTRACODE_APPROVAL` | `1` | Whether a human must release the run before any node starts. The gate is a **PAUSED DAG node**, not a prompt, so it survives a crash |
+| `AGENT2_VERIFY_MAX_ROWS` | `500` | Durable rows one verification read may consult. ⚠️ There is deliberately **no** `AGENT2_VERIFY=0` — verification off does not make Agent-2 quieter, it makes it credulous |
+| `AGENT2_RESUME` | `off` | Whether a launch continues the last conversation **by itself**. `off` by default; `/load`, `--continue` and the browser's `load` command are a human asking out loud |
+
 Other limits worth knowing: `MAX_CTX_MESSAGES=40`, `MAX_TOOL_OUTPUT=6000`,
 `MAX_AGENT_ITERS=80`, `AGENT2_MAX_FILE_SIZE` 100 MB.
 
@@ -300,7 +324,7 @@ Other limits worth knowing: `MAX_CTX_MESSAGES=40`, `MAX_TOOL_OUTPUT=6000`,
 
 ## 🖥 CLI commands
 
-Twenty-nine slash commands. The full table, with the grammars that have real depth, is at
+Thirty-six slash commands. The full table, with the grammars that have real depth, is at
 [**Slash commands**](https://agent2.is-best.net/docs/cli-commands/). The families worth knowing here:
 
 ```
@@ -313,6 +337,26 @@ Twenty-nine slash commands. The full table, with the grammars that have real dep
 /tasks · /pause · /resume             background work, paused and picked up again
 /offline                              which subsystems may reach the network
 /history · /clearhistory              transcript · wipe it
+
+/init [description]                   analyse THIS workspace, write .agent2/agent2.md
+/skills [list|on|off|reset|show|last|reload]
+                                      the project's own skills — a block list, not a force list
+
+/workflow                             the plans in .agent2/workflows/ — executes nothing
+/workflow run <name>                  validate → build the DAG → SHOW THE PLAN → run
+/workflow auto <goal>                 a goal sentence becomes a graph; the plan is drawn first
+/workflow state                       the live run, the waves, what starts next — and it
+                                      releases what a dead process parked, by name
+
+/ultracode start <goal>               the autonomous loop. One of exactly two doors
+/ultracode run                        drive it — terminal only; the browser's next turn does
+                                      this work through workflow.for_turn()
+/ultracode approve · cancel · state · policy
+
+/health                               ✓/⚠/✗/○ per subsystem, then problems and warnings
+/metrics [reset]                      thirteen signals — count · avg · p50 · p95 · max
+/recovery [scan|ack|retry|kill <kind> <id>]
+                                      what a killed run left behind, and what the scan decided
 
 /model [name|auto]                    switch model (auto = Agent-2 picks per turn)
 /model routing [off|default_only|always]
@@ -344,14 +388,28 @@ and prints where it went — a command is never silently removed.
 
 ## 🌐 API surface
 
-- **67 HTTP endpoints** — 63 in `agent2/server/routes.py`, 4 in `agent2/server/auth.py`.
+- **81 METHOD+path pairs** in `agent2/server/routes.py` — the things a client can actually
+  call, not the decorators — plus **4** in `agent2/server/auth.py`.
   Full reference: [**REST API**](https://agent2.is-best.net/docs/rest-api/).
-- **29 server→client Socket.IO events, 10 client→server handlers.** Full reference:
+- **25 distinct server→client Socket.IO events; 8 guarded client→server handlers** plus
+  `connect`/`disconnect`. `guarded(event)` is the one way a data handler is registered, so a
+  handler and its capability arrive together. Full reference:
   [**Socket.IO events**](https://agent2.is-best.net/docs/socket-api/).
 
 Highlights: `GET /api/health` (aggregate, `200`/`503` + `problems`, counters only — and a
 *disabled* MCP server is not a problem), `GET /api/mcp` (every server, never a credential),
 `GET /api/commands`, `GET /api/sync`, `GET /api/models`, `GET /api/platform`.
+
+The graph family's routes read the same way the commands do. `GET /api/workflows` takes
+`?force=1` and `?verify=1` — verification is **asked for, never volunteered**, because
+`runner.verify()` reads two ledgers and writes an audit line every time it runs, and a panel
+polls this endpoint. `POST /api/workflows/auto` defaults to `mode: "plan"`, which writes
+nothing at all. `GET`/`POST /api/ultracode` are the web half of the loop, with `start` ·
+`approve` · `cancel` — and **`run` is terminal-only, named in the panel rather than omitted**,
+because `engine.drive()` needs a synchronous worker owning a whole model turn and a request
+thread has neither the `sid` nor the stream. A refusal from any of them is
+`{"ok": false, "reason": …}` inside a `200`, and no payload ever carries a node's
+`instruction`.
 
 `/api/burp*` is gone: the four bespoke Burp routes were removed once `/api/mcp` reached
 parity. Do not add a per-server route set back — that is the drift `/api/mcp` exists to end.
@@ -367,6 +425,9 @@ User message
                                  rejects a full backlog with a visible message
   → agent.py:run_agent()         (or llm/provider_agent.py for custom providers)
       → pil.learn_from_message() + pil.process_outgoing_prompt()
+      → core/broker.assemble()      ONE bundle per turn — 10 sources, one guard each,
+                                    then budget.apply() decides what FITS
+                                    → system_prompt(context=bundle)
       → core/diffs.capture_for()    snapshot BEFORE a file-writing tool runs
       → tools.dispatch_tool()       local tools
       → terminal.stream_command()   run_command (shell)
@@ -374,6 +435,32 @@ User message
       → fileintel.EXECUTOR          detect / run / convert / search
   → Socket.IO stream → browser  /  Rich output → CLI
 ```
+
+There is a second, deliberately separate arm — **autonomous execution**. It shares the DAG,
+the task rows, the checkpoints and the verifier with the turn path above, and it is reachable
+through **two doors only**, because this loop writes code:
+
+```
+/ultracode start <goal>  |  POST /api/ultracode {"action":"start"}
+  → core/ultracode/engine.start()
+      → plan.brief()                 evidence: projectscan + gitstate + skills,
+                                     names and counts only, never prose
+      → skills.for_turn()            DISCOVER SKILLS, before a model sees the goal
+      → workflow/dynamic.draft()     the goal becomes steps (one broker.assemble())
+      → plan.graph_for()             steps + a verify node (+ a PAUSED approval gate
+                                     the roots depend on, unless it is off)
+      → dag/store.create()           1 exec_workflows row + N agent_tasks rows
+  → engine.drive()                   ↺ schedule.run() — plan_next() picks; every declined
+                                       node says why
+      → engine.work(node)            dispatch on Node.kind (build · check · approval · fix)
+      → core/verify.verify_tasks()   the record, not the claim
+      → dynamic.replan()             only on R_BLOCKED / R_EXHAUSTED
+  → engine.finalize()                re-reads, verifies, THEN settles
+```
+
+An ordinary prompt can never enter here, however the knobs are set — the importer list is
+asserted structurally rather than promised. The **stage is derived from the rows and never
+stored**, so a run killed mid-flight reports the stage that is true now.
 
 | Entry point | Role |
 |-------------|------|
@@ -389,7 +476,7 @@ The `agent2/` package: `server/` (browser surface), `cli/`, `llm/`, `integration
 The old flat paths (`agent2.keys`, `agent2.routes`, …) remain as shims resolving to the **same
 module object and singletons** — `agent2.keys.rotator is agent2.llm.keys.rotator`.
 
-Storage: **22 SQLite tables, 18 migrations**, WAL mode, a pooled connection layer, and a
+Storage: **27 SQLite tables, 32 migrations**, WAL mode, a pooled connection layer, and a
 checkpoint thread. Nothing outside `database.py` may `import sqlite3`.
 
 Full map: [**Architecture**](https://agent2.is-best.net/docs/architecture/).
@@ -399,11 +486,11 @@ Full map: [**Architecture**](https://agent2.is-best.net/docs/architecture/).
 ## 🧪 Tests
 
 ```bash
-python -m pytest .github/tests/                 # 1602 tests
+python -m pytest .github/tests/                 # 2670 tests
 python -m pytest .github/tests/test_config.py   # single file
 ```
 
-**1602 tests across 37 test modules**, all under `.github/tests/` (the root `test/` directory is empty).
+**2670 tests (2668 pass, 2 skip) across 51 test modules**, all under `.github/tests/` (the root `test/` directory is empty).
 Many are **sabotage-verified** — the test was proven to fail against a deliberate break, not
 assumed to work. Treat a test that looks trivial as suspect only after reading it: two
 *tautology traps* — assertions that compared a thing to itself and stayed green while the
@@ -459,7 +546,7 @@ More, with the code behind each: [**Troubleshooting**](https://agent2.is-best.ne
 
 ## 📚 Documentation
 
-The full documentation is 39 pages at [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) — served statically,
+The full documentation is 45 pages at [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) — served statically,
 no build step. Every subsystem page states the rule **and the bug the rule prevents**.
 
 | | |
@@ -467,7 +554,8 @@ no build step. Every subsystem page states the rule **and the bug the rule preve
 | [What Agent-2 is](https://agent2.is-best.net/docs/overview/) · [Install](https://agent2.is-best.net/docs/install/) · [First session](https://agent2.is-best.net/docs/quickstart/) · [Docker](https://agent2.is-best.net/docs/docker/) | Start here |
 | [API keys](https://agent2.is-best.net/docs/api-keys/) · [Models & modes](https://agent2.is-best.net/docs/models/) · [Capabilities](https://agent2.is-best.net/docs/model-capabilities/) · [Routing](https://agent2.is-best.net/docs/routing/) · [Providers](https://agent2.is-best.net/docs/providers/) · [Workspaces](https://agent2.is-best.net/docs/workspaces/) · [Environment](https://agent2.is-best.net/docs/env/) | Configure |
 | [The CLI](https://agent2.is-best.net/docs/cli/) · [Menus](https://agent2.is-best.net/docs/menus/) · [Web UI](https://agent2.is-best.net/docs/web-ui/) · [Dual mode](https://agent2.is-best.net/docs/dual/) · [Diffs](https://agent2.is-best.net/docs/diffs/) | Surfaces |
-| [The 17 tools](https://agent2.is-best.net/docs/tools/) · [Context broker](https://agent2.is-best.net/docs/context/) · [Git awareness](https://agent2.is-best.net/docs/git-state/) · [Memory & rules](https://agent2.is-best.net/docs/memory/) · [Tasks](https://agent2.is-best.net/docs/tasks/) · [Commands](https://agent2.is-best.net/docs/commands/) · [PIL](https://agent2.is-best.net/docs/pil/) · [File Intelligence](https://agent2.is-best.net/docs/fileintel/) | The agent |
+| [The 18 tools](https://agent2.is-best.net/docs/tools/) · [Context broker](https://agent2.is-best.net/docs/context/) · [Git awareness](https://agent2.is-best.net/docs/git-state/) · [Memory & rules](https://agent2.is-best.net/docs/memory/) · [Tasks](https://agent2.is-best.net/docs/tasks/) · [Commands](https://agent2.is-best.net/docs/commands/) · [PIL](https://agent2.is-best.net/docs/pil/) · [File Intelligence](https://agent2.is-best.net/docs/fileintel/) | The agent |
+| [The DAG](https://agent2.is-best.net/docs/dag/) · [Workflows](https://agent2.is-best.net/docs/workflows/) · [UltraCode](https://agent2.is-best.net/docs/ultracode/) · [Skills](https://agent2.is-best.net/docs/skills/) · [Project doc](https://agent2.is-best.net/docs/project-doc/) · [Health & metrics](https://agent2.is-best.net/docs/health/) | Autonomy |
 | [Security testing](https://agent2.is-best.net/docs/security-testing/) · [Burp & ZAP](https://agent2.is-best.net/docs/mcp/) · [Web auth](https://agent2.is-best.net/docs/web-auth/) · [Capabilities](https://agent2.is-best.net/docs/authorization/) · [Secrets](https://agent2.is-best.net/docs/secrets/) | Security |
 | [Slash commands](https://agent2.is-best.net/docs/cli-commands/) · [REST API](https://agent2.is-best.net/docs/rest-api/) · [Socket.IO](https://agent2.is-best.net/docs/socket-api/) · [Database](https://agent2.is-best.net/docs/database/) · [Sync](https://agent2.is-best.net/docs/sync/) · [Logging](https://agent2.is-best.net/docs/logging/) · [Architecture](https://agent2.is-best.net/docs/architecture/) · [Troubleshooting](https://agent2.is-best.net/docs/troubleshoot/) | Reference |
 

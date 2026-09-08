@@ -20,7 +20,8 @@ Coverage (Task 20)
     particular cannot strip the user's rules (which render last)
   - the sources themselves: project docs deduped case-insensitively, git silent
     outside a repo, MCP rendering only the *negative* case, conversation pinned
-    and text-free, skills/workflow declared but empty until Phases 11/12
+    and text-free, skills filled through the declared slot by Task 34, workflow
+    still declared but empty until Phase 12
   - `gitstate`: total outside a repo, total with no git binary, and cached
 
 Coverage (Task 21 — ``broker/sources.py``)
@@ -467,13 +468,67 @@ def test_files_source_reports_this_sessions_changes(monkeypatch):
     assert "THIS SESSION" in item.text.upper()
 
 
-def test_skills_and_workflow_are_declared_but_empty_until_their_phases():
-    """Declared now so Phase 11/12 arrive by `register()`, not by editing collect()."""
+def test_the_workflow_slot_is_empty_when_no_run_is_live():
+    """Phase 12 landed through the declared slot, so this is now the *idle* case.
+
+    ⚠️ THE OLD FORM OF THIS TEST WAS THE TAUTOLOGY ITS NEIGHBOUR WARNS ABOUT. It
+    read `== []` under the docstring "declared but empty until its phase", which
+    stayed green after Task 37 only because no run is live in this file — "the
+    collector does nothing" and "nothing is running" being indistinguishable. The
+    filled case is pinned in `test_workflow.py` against a real run; what belongs
+    here is that an idle turn spends nothing on it and the slot still exists.
+    """
     bundle = B.assemble(chat_id="c1")
-    assert bundle.get(B.SOURCE_SKILLS) == []
-    assert bundle.get(B.SOURCE_WORKFLOW) == []
-    assert B.SOURCE_SKILLS in B.registered()
     assert B.SOURCE_WORKFLOW in B.registered()
+    assert bundle.get(B.SOURCE_WORKFLOW) == []
+    assert "WORKFLOW IN PROGRESS" not in bundle.prompt_tail()
+    assert B.SOURCE_WORKFLOW not in bundle.errors        # absent, not broken
+
+
+def test_the_skills_slot_is_filled_by_registration_not_by_editing_collect(tmp_path):
+    """Task 34 landed the way Task 20 said it would — through the declared slot.
+
+    ⚠️ THE OLD FORM OF THIS TEST WAS A TAUTOLOGY WAITING TO HAPPEN. It asserted
+    `bundle.get(SOURCE_SKILLS) == []`, which stayed green after Phase 11 only
+    because *this* repo has no `.agent2/skills/` — so "the collector is empty by
+    design" and "this project owns no skills" were indistinguishable, and the
+    wiring Task 34 exists for was pinned by nothing. The slot is asserted against a
+    project that HAS a skill.
+    """
+    from agent2.core import workspace as W
+    from agent2.core.skills import discovery as D
+    sk = tmp_path / ".agent2" / "skills" / "threat-model"
+    sk.mkdir(parents=True)
+    (sk / "SKILL.md").write_text(
+        "---\nname: Threat Model\ndescription: Enumerate attack surface\n"
+        "keywords: threat, attack surface\nalways: true\n---\n\nStart with trust boundaries.\n",
+        encoding="utf-8")
+    W.set_workspace(str(tmp_path))
+    D.invalidate()
+    try:
+        bundle = B.assemble(chat_id="c1", message="help me threat model this")
+        items = bundle.get(B.SOURCE_SKILLS)
+        assert items, "a project with a skill must reach the declared skills slot"
+        assert "Threat Model" in items[0].text
+        assert B.SOURCE_SKILLS in bundle.sources_used()
+    finally:
+        W.set_workspace(os.getcwd())
+        D.invalidate()
+
+
+def test_the_skills_slot_stays_empty_for_a_project_without_skills(tmp_path):
+    """`skills` absent is not `skills` broken — and it costs no `errors` entry."""
+    from agent2.core import workspace as W
+    from agent2.core.skills import discovery as D
+    W.set_workspace(str(tmp_path))
+    D.invalidate()
+    try:
+        bundle = B.assemble(chat_id="c1", message="anything at all")
+        assert bundle.get(B.SOURCE_SKILLS) == []
+        assert B.SOURCE_SKILLS not in dict(bundle.errors)
+    finally:
+        W.set_workspace(os.getcwd())
+        D.invalidate()
 
 
 def test_a_later_phase_can_replace_a_source_without_editing_collect():
@@ -836,9 +891,32 @@ def test_ttl_for_git_is_read_live_from_gitstate(monkeypatch):
     assert SRC.ttl_for(B.SOURCE_GIT) == 99.0
 
 
+def test_ttl_for_skills_is_read_live_from_discovery(monkeypatch):
+    """The second cached source (Task 34), and the copy trap is identical.
+
+    ⚠️ `skills` is cached for exactly the same reason `git_state` is — discovery
+    walks the filesystem and runs once per turn per surface — so it is the second
+    source whose TTL can go stale. `ttl_for` reads `discovery.SKILLS_TTL` live for
+    the same reason it reads `gitstate.GIT_TTL` live: a literal here would report a
+    minute-old catalog as perfectly fresh, and only the freshness *measure* would
+    be wrong, which is the half nobody looks at.
+    """
+    from agent2.core.skills import discovery as D
+    monkeypatch.setattr(D, "SKILLS_TTL", 77.0)
+    assert SRC.ttl_for(B.SOURCE_SKILLS) == 77.0
+
+
 def test_every_other_source_is_read_live_so_it_cannot_be_stale():
+    """⚠️ The cached set is a CLOSED list, and adding to it must be deliberate.
+
+    Every source but `git_state` and `skills` is read live inside its collector, so
+    its freshness is 1.0 by construction. A later phase that starts caching a third
+    source without declaring a TTL here would keep reporting stale data as fresh —
+    so the exemption list is spelled out rather than derived.
+    """
+    cached = {B.SOURCE_GIT, B.SOURCE_SKILLS}
     for s in B.ORDER:
-        if s == B.SOURCE_GIT:
+        if s in cached:
             continue
         assert SRC.ttl_for(s) == 0.0
         assert SRC.freshness_of(s, stamp=time.time() - 10_000) == 1.0
@@ -1375,4 +1453,194 @@ def test_a_plan_that_kept_everything_logs_nothing(monkeypatch):
                         lambda *a, **k: seen.append((a, k)))
     B.assemble(chat_id="c-nolog", message="anything", model_key="2.5-flash")
     assert seen == [], "a normal turn logged a trim that did not happen"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE CLI IS A BROKER SURFACE TOO
+# ══════════════════════════════════════════════════════════════════════════════
+# Tasks 20–23 landed with two loops wired to the broker — `agent.py` and
+# `llm/provider_agent.py` — and both of those are the WEB half. The CLI, which is
+# the DEFAULT surface, had neither: `cli/prompt.build_sys_prompt()` built its own
+# `## MEMORIES:` / `## CUSTOM RULES` tail out of `store.load_mems()` /
+# `load_rules()`. A terminal user therefore got:
+#
+#   * no project document, no git state, no persistent-plan block, no "this MCP
+#     server is enabled and not answering" warning, no changed-files list — every
+#     situational source the browser had;
+#   * NO TOKEN BUDGET AT ALL, on the surface where a user is most likely to paste
+#     a large file into a small custom-provider window;
+#   * memories and rules in the OPPOSITE order from the other two loops, under a
+#     third top-20 bound, with an `[9/10]` importance prefix nothing else emits.
+#
+# Nothing raised. Each half looked right on its own — and that is also why a
+# source added by a later phase (Skills in Task 34, Workflow in Task 39) would
+# have reached the browser and silently never reached the terminal.
+#
+# These pin both ends of the fix: the renderer may not rebuild the tail, and both
+# CLI loops must hand it a bundle they assembled for THIS turn.
+
+def _cli_prompt():
+    from agent2.cli import prompt as P
+    return P
+
+
+def test_the_cli_prompt_with_no_bundle_is_exactly_the_base_tail():
+    """No bundle ⇒ the two cached blocks, the same as a bare `system_prompt()`."""
+    M.add_memory("the launcher is run.py", 9)
+    R.add_rule("run pytest before claiming done")
+    sp = _cli_prompt().build_sys_prompt()
+    assert sp.endswith(B.base_tail() + "\n"), (
+        "the CLI prompt no longer ends with the broker's tail — it is building "
+        "its own again")
+
+
+def test_the_cli_prompt_renders_memory_before_rules():
+    """⚠️ THE OLD CLI COPY EMITTED RULES FIRST. One `ORDER`, three surfaces.
+
+    Sabotage: swap the two items in `base_tail()` and this fails while the prompt
+    still contains both blocks — which is exactly how the drift survived review.
+    """
+    M.add_memory("MEM-MARKER-CLI", 9)
+    R.add_rule("RULE-MARKER-CLI")
+    sp = _cli_prompt().build_sys_prompt()
+    assert "MEM-MARKER-CLI" in sp and "RULE-MARKER-CLI" in sp
+    assert sp.index("MEM-MARKER-CLI") < sp.index("RULE-MARKER-CLI"), (
+        "the CLI ends the prompt on memories instead of on the user's standing "
+        "rules — the browser and the terminal now disagree about one project")
+
+
+def test_the_cli_prompt_renders_every_item_the_budget_sent():
+    """The whole point of the fix: situational sources reach the terminal too."""
+    M.add_memory("agent2.db is the only state", 8)
+    R.add_rule("never import sqlite3 outside database.py")
+    bundle = B.assemble(chat_id="c-cli", message="what branch am I on",
+                        model_key="2.5-flash", mode_key="pro", surface="cli",
+                        conversation_messages=2, conversation_tokens=120)
+    sp = _cli_prompt().build_sys_prompt(context=bundle)
+
+    assert sp.endswith(bundle.prompt_tail() + "\n")
+    for item in bundle.sent():
+        if (item.text or "").strip():
+            assert item.text in sp, (
+                f"{item.source} survived the budget and never reached the prompt")
+    assert set(bundle.sources_used()) >= {B.SOURCE_MEMORY, B.SOURCE_RULES}
+    assert bundle.plan is not None, "the CLI turn was never budgeted"
+
+
+def test_the_cli_prompt_builds_no_second_memories_or_rules_block():
+    """⚠️ SOURCE-LEVEL, because a rebuilt block is invisible in the OUTPUT.
+
+    A reintroduced `load_mems()` block renders memories the broker also renders:
+    the prompt then carries the section twice, both copies read plausibly, and only
+    the bound and the ordering differ. Asserting on rendered text cannot see that.
+    Asserting that the renderer never READS the tables can.
+    """
+    import ast
+    import inspect
+
+    P = _cli_prompt()
+    called = {getattr(n.func, "id", "") or getattr(n.func, "attr", "")
+              for n in ast.walk(ast.parse(inspect.getsource(P)))
+              if isinstance(n, ast.Call)}
+    for banned in ("load_mems", "load_rules", "list_memories", "list_rules",
+                   "memory_block", "rules_block"):
+        assert banned not in called, (
+            f"cli/prompt.py calls {banned}() again — that is a second declaration "
+            "of what the prompt ends with, and it drifted three ways last time")
+    body = inspect.getsource(P.build_sys_prompt)
+    assert "## MEMORIES" not in body and "## CUSTOM RULES" not in body, (
+        "the CLI is hand-writing a standing block again")
+
+
+def test_both_cli_loops_assemble_one_bundle_and_hand_it_to_the_prompt():
+    """⚠️ AST, not behaviour: neither CLI loop is callable from a test.
+
+    And the defect is a *missing* call, which produces a prompt that is merely
+    smaller — no error, no log line, nothing on screen. Same reason `test_cli.py`
+    parses the AST for `record_usage`.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import agent2cli as cli
+
+    for fn in (cli.run_agent, cli.run_provider_agent_cli):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+        assembles = [n for n in calls if getattr(n.func, "attr", "") == "assemble"]
+        prompts = [n for n in calls
+                   if getattr(n.func, "id", "") == "build_sys_prompt"]
+
+        assert len(assembles) == 1, (
+            f"{fn.__name__} assembles {len(assembles)} bundles — exactly one per "
+            "turn, never zero (no situational context) and never one per iteration "
+            "(a different prompt halfway through one turn)")
+        assert prompts, f"{fn.__name__} no longer builds a system prompt"
+        for call in prompts:
+            assert any(k.arg == "context" for k in call.keywords), (
+                f"{fn.__name__} builds the prompt without handing it the bundle — "
+                "the terminal silently loses every situational source")
+
+        kw = {k.arg for k in assembles[0].keywords}
+        for needed in ("conversation_messages", "conversation_tokens"):
+            assert needed in kw, (
+                f"{fn.__name__} assembles a bundle without {needed}, so Task 22 "
+                "budgets the situational sources against a conversation of size "
+                "zero and the overflow lands at the vendor")
+
+
+# ── One emitter for a lost source ──────────────────────────────────────────────
+
+def test_assemble_logs_every_failed_source_and_collect_stays_silent(monkeypatch):
+    """⚠️ ONE EMITTER, FOR THE REASON THE TRIM HAS ONE.
+
+    `agent.py` and `provider_agent.py` each carried this loop and `agent2cli.py`
+    would have been the third. A warning emitted per surface ends up emitted by
+    only some of them, and the loop nobody remembered then loses a context source
+    with no record anywhere — which is the entire point of the event.
+
+    `collect()` stays silent so a report or a dry-run can gather without writing to
+    the audit log.
+    """
+    seen = []
+    from agent2.core import logging as alog
+    monkeypatch.setattr(alog, "context_source_failed",
+                        lambda src, err: seen.append((src, err)))
+
+    def boom(_req):
+        raise RuntimeError("no git here")
+
+    monkeypatch.setitem(B._COLLECTORS, B.SOURCE_GIT, boom)
+
+    quiet = B.collect(B.request(chat_id="c-q", message="hi"))
+    assert B.SOURCE_GIT in quiet.errors, "the failure was not recorded on the bundle"
+    assert seen == [], "collect() wrote to the audit log — it is the pure step"
+
+    B.assemble(chat_id="c-l", message="hi")
+    assert [s for s, _ in seen] == [B.SOURCE_GIT], (
+        "assemble() did not log the one source it lost")
+    assert "RuntimeError" in seen[0][1]
+
+
+def test_no_surface_carries_its_own_source_failure_loop():
+    """The three turn loops may not re-emit what `assemble()` already emits."""
+    import inspect
+
+    import agent2cli as cli
+    from agent2.llm import provider_agent as PA
+
+    for mod in (A, PA, cli):
+        assert "context_source_failed" not in inspect.getsource(mod), (
+            f"{mod.__name__} logs failed context sources itself — two emitters "
+            "means one turn is reported twice from one surface and once from "
+            "another")
+
+
+def test_freshness_is_reported_at_the_same_precision_as_relevance():
+    """Both are ordering hints a payload prints; one arrived as raw float noise."""
+    now = 1_000_000.0
+    val = SRC.freshness_of(B.SOURCE_GIT, now - G.GIT_TTL * 0.37, now=now)
+    assert 0.0 < val < 1.0
+    assert val == round(val, 3), f"freshness reached a report as {val!r}"
 

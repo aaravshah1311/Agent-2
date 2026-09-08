@@ -207,16 +207,24 @@ def test_every_governed_table_carries_the_column_not_null():
 
 
 def test_the_scoped_table_list_names_the_tables_that_actually_have_the_column():
-    """The declaration and the schema must agree in both directions.
+    """The declaration and the schema must agree, and the list is spelled out.
 
     A table listed here without the column makes `scope_sql()` produce SQL that
-    cannot run; a table with the column that is NOT listed is one nobody knows is
-    governed.
+    cannot run, so the loop checks that direction. ⚠️ The reverse direction is
+    deliberately a **literal set** rather than a `sqlite_master` walk for
+    `project` columns: seven other tables carry one (`mcp_state`, the four `exec_*`
+    tables, `pil_vocab`, `pil_phrases`) and each is scoped by the module that owns
+    it — `mcp_state` by `context.project_key()`, the ledger by whoever wrote the
+    row. `SCOPED_TABLES` means *governed by this policy*, not *has a column named
+    project*, and deriving one from the other would put four recovery tables under
+    a switch (`AGENT2_CONTEXT_ISOLATION=off`) that was never meant to reach them.
+
+    So adding a table here is a decision somebody has to type, and `skill_state`
+    (Phase 11, migration 29) is the third one typed.
     """
     for table in iso.SCOPED_TABLES:
         assert iso.COLUMN in _cols(table)
-    assert set(iso.SCOPED_TABLES) == {"memories", "rules"}, (
-        "Phase 11's skill state joins this tuple — update the docstring with it")
+    assert set(iso.SCOPED_TABLES) == {"memories", "rules", "skill_state"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

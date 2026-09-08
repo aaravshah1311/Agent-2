@@ -19,6 +19,20 @@ bridges, then `_LOCAL_TOOLS`, where `agent.py` checks `_LOCAL_TOOLS` first. That
 is harmless for exactly one reason: `McpBridge.sanitize_name` force-prefixes every
 MCP tool, so no MCP name can shadow a local one. Read
 `integrations/mcp_base.py`'s docstring before relaxing anything about that prefix.
+
+⚠️ THIS IS THE ONE AGENT LOOP THAT RUNS A **BATCH** OF TOOL CALLS, SO THE CANCEL
+TOKEN IS ASKED BEFORE EVERY ONE OF THEM. Both wire formats may return several
+tool calls in a single response; the guard at the top of the iteration has already
+been passed by the time the second one runs, so a Stop pressed during call 1 used
+to let the rest of the batch execute — `run_command`, `write_file` and
+`delete_file` included. That is the whole of what Stop is for on this surface, and
+it failed silently, because a cancelled turn that still ran four tools looks in
+the transcript exactly like a turn that was not cancelled in time.
+Abandoning a batch half-answered is safe on the wire: `messages` is reseeded from
+the `user`/`assistant` rows alone on every turn, so the unanswered `tool_use` is
+never sent to a provider that would reject it. Compare `agent2cli.run_agent`,
+which asks `cancelled()` inside its own per-call loop, and `agent.py`, which asks
+once because it runs one call per iteration.
 """
 
 from __future__ import annotations
@@ -40,11 +54,12 @@ from agent2.llm.resilience import (
     call_with_retry, classify_error, is_blank_reply, blank_reply_notice,
 )
 from agent2.core.session import sessions
+from agent2.core.context import MSG_ORDER_DESC
 from agent2.core import workspace as _workspace
 from agent2.core import diffs as _diffs
 from agent2.core import recovery as _recovery
 from agent2.core import broker as _broker
-from agent2.core import logging as alog
+from agent2.core import metrics as _metrics
 from agent2.core.progress import TurnProgress, stage_for_tool
 from agent2.agent import (
     system_prompt, save_msg, _LOCAL_TOOLS, _tool_label, _tool_result_summary,
@@ -234,6 +249,17 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
         prog.clear_finished()
         sessions.close(sid, chat_id)
 
+    def _stopped(tokens: int) -> None:
+        # ONE spelling of "the user pressed Stop", because five places can notice
+        # it: before the model call, after a provider error, and before each tool
+        # of a batch — twice, once per wire format. Five hand-written copies is
+        # five chances for one to omit the `done: True` the browser needs to
+        # unstick its composer, and the omission is invisible on the surface that
+        # got it right.
+        socketio.emit("chat_response", {"text": "_Stopped by user._", "done": True,
+                                        "tokens": tokens}, room=sid)
+        _finish()
+
     save_msg(chat_id, "user", user_message,
              {"attachments": [a["name"] for a in (attachments or [])]})
 
@@ -299,7 +325,7 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
     # tool round-trips within THIS turn are kept in the provider-native format).
     history = qall(
         "SELECT role, content FROM messages WHERE chat_id=? "
-        "AND role IN ('user','assistant') ORDER BY created_at DESC LIMIT 20",
+        f"AND role IN ('user','assistant') {MSG_ORDER_DESC} LIMIT 20",
         (chat_id,))
     history.reverse()
     messages: list[dict] = [{"role": h["role"] if h["role"] == "user" else "assistant",
@@ -323,7 +349,8 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
     # the prompt cannot be built until `messages` exists. Parity with `agent.py` is
     # this module's contract — a source the Gemini loop injects and this one does
     # not is a capability the user loses by switching model — so the bundle is
-    # assembled here on the same terms and passed in the same way.
+    # assembled here on the same terms and passed in the same way. A source that
+    # failed is logged by `assemble()` itself, in one place for all three loops.
     _bundle = _broker.assemble(
         chat_id=chat_id, message=sent_message, surface="web",
         model_key="custom:" + str(prov.get("id") or ""),
@@ -331,8 +358,6 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
         conversation_tokens=router.estimate_tokens(
             "".join(str(m.get("content") or "") for m in messages)),
     )
-    for _src, _err in _bundle.errors.items():
-        alog.context_source_failed(_src, _err)
 
     system = system_prompt(burp_connected=burp.is_connected(),
                            burp_tool_count=len(burp.list_tools()),
@@ -342,9 +367,7 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
     total_tokens = 0
     for _ in range(MAX_AGENT_ITERS):
         if stop.is_set():
-            socketio.emit("chat_response", {"text": "_Stopped by user._", "done": True,
-                                            "tokens": total_tokens}, room=sid)
-            _finish()
+            _stopped(total_tokens)
             return
         prog.stage("Calling Model", str(prov.get("model_id") or "")[:40])
         try:
@@ -378,9 +401,7 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                 failure_reason=str(exc), chat_id=chat_id, session_id=sid)
             router.note_failure(_model_key, classify_error(exc))
             if stop.is_set():
-                socketio.emit("chat_response", {"text": "_Stopped by user._", "done": True,
-                                                "tokens": total_tokens}, room=sid)
-                _finish()
+                _stopped(total_tokens)
                 return
             extra = ("\n\n> Temporary network/server issue — retried automatically. Please try again."
                      if classify_error(exc) == "transient" else "")
@@ -397,6 +418,7 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
         router.note_success(_pid_key)
 
         total_tokens += result.get("tokens", 0) or 0
+        _metrics.tokens(_pid_key, result.get("tokens", 0) or 0)
         socketio.emit("token_update", {"chat_id": chat_id, "tokens": total_tokens}, room=sid)
         tool_calls = result.get("tool_calls") or []
 
@@ -420,10 +442,16 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
             return
 
         # Append the assistant turn (native format) then execute each tool.
+        # ⚠️ The cancel token is asked before EVERY call in the batch, not once per
+        # iteration — see the module docstring for why abandoning a half-answered
+        # batch is safe on the wire.
         if fmt == "anthropic":
             messages.append({"role": "assistant", "content": result.get("raw_content", [])})
             tool_results = []
             for tc in tool_calls:
+                if stop.is_set():
+                    _stopped(total_tokens)
+                    return
                 out, ok = _exec_tool(tc["name"], tc["args"], sid, term_id, socketio, ctx, prog)
                 save_msg(chat_id, "tool_call", _tool_desc(tc["name"], tc["args"]),
                          _tool_meta(tc["name"], tc["args"]))
@@ -441,6 +469,9 @@ def run_provider_agent(chat_id, user_message, sid, term_id, pid, socketio,
                                                "arguments": json.dumps(tc["args"])}}
                                  for tc in tool_calls]})
             for tc in tool_calls:
+                if stop.is_set():
+                    _stopped(total_tokens)
+                    return
                 out, ok = _exec_tool(tc["name"], tc["args"], sid, term_id, socketio, ctx, prog)
                 save_msg(chat_id, "tool_call", _tool_desc(tc["name"], tc["args"]),
                          _tool_meta(tc["name"], tc["args"]))

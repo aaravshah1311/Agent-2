@@ -113,8 +113,8 @@ def _env_int(name: str, default: int) -> int:
     """An env knob, read at CALL time and never at import.
 
     Import-time reads would make the two overrides untestable without reimporting
-    the module, and would freeze a value that `/api/context` is expected to report
-    honestly. The read happens once per turn, not once per agent iteration.
+    the module, and would freeze a value a surface is expected to report honestly.
+    The read happens once per turn, not once per agent iteration.
     """
     try:
         raw = (os.environ.get(name) or "").strip()
@@ -399,7 +399,7 @@ def notice(p: BudgetPlan | None) -> str:
 
 
 def describe() -> dict:
-    """The policy itself, for `/api/health` and `/api/context`. Knobs, not a turn."""
+    """The policy itself — knobs, never a turn's ceiling. Read by `broker.stats()`."""
     return {
         "assumed_window": ASSUMED_WINDOW,
         "reserve": max(0, _env_int(ENV_RESERVE, RESERVE_TOKENS)),

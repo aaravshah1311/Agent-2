@@ -289,6 +289,16 @@ def main() -> int:
     init_db()
     init_providers_table()
 
+    # Crash recovery (Task 25 §1) — once, here, before either half is live.
+    # ⚠️ THE CLI CHILD SCANS TOO, AND THAT IS NOT A DUPLICATE BUG. Dual mode is two
+    # processes over one DB, so each has to be able to recover on its own when run
+    # alone; running this first simply means the child finds the work already
+    # resolved and skips it (`_advance` compare-and-swaps through
+    # `resolve_interrupted`, and a settled recovery row is in the skip set). It still
+    # PRINTS the panel, because that reads the durable rows rather than its own scan.
+    from agent2.core.recovery import crash as _crash
+    _crash.scan_on_start()
+
     host = os.environ.get("AGENT2_HOST", "0.0.0.0")
     try:
         wanted = int(os.environ.get("AGENT2_PORT", ports.DEFAULT_PORT))

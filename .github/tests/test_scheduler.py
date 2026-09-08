@@ -412,3 +412,124 @@ def test_shutdown_stops_the_workers():
     ran = threading.Event()
     scheduler.submit(ran.set, sid="s1")
     assert ran.wait(5), "the pool did not restart after shutdown"
+
+
+def test_shutdown_stops_the_workers_even_when_the_queue_is_full():
+    """The state a pool is actually shut down in.
+
+    `shutdown()` used to post its stop sentinels with `put_nowait` and swallow
+    `queue.Full`, so a saturated pool — the only kind anybody shuts down — was
+    told nothing. The workers stayed blocked in `_q.get()` forever, the join
+    timed out, and `_workers.clear()` then made them unreachable: they could
+    never be signalled again and they raced the next pool for its sentinels.
+    That is how eight tracked workers became sixteen live ones.
+    """
+    gate = threading.Event()
+    try:
+        _saturate(gate)
+        for _ in range(scheduler._MAX_QUEUE):
+            scheduler.submit(gate.wait, 10, sid="filler")
+        assert scheduler.submit(gate.wait, 10, sid="overflow") == scheduler.REJECTED, (
+            "premise broken — the queue is not full"
+        )
+        threads = [t for t in scheduler._workers if t.is_alive()]
+        assert threads, "premise broken — no workers to stop"
+    finally:
+        gate.set()
+
+    assert scheduler.shutdown() is True, (
+        "shutdown() reported workers it could not stop"
+    )
+    for t in threads:
+        t.join(5)
+        assert not t.is_alive(), (
+            "a worker survived a shutdown issued against a full queue — its "
+            "sentinel was dropped"
+        )
+    assert not [t for t in scheduler._workers if t.is_alive()]
+
+
+def test_a_busy_worker_stays_tracked_after_a_timed_out_shutdown(monkeypatch):
+    """A live worker the pool has forgotten is unstoppable, and it double-books.
+
+    `shutdown()` cleared `_workers` whether or not the join succeeded, so a worker
+    still running its turn vanished from the pool's own view: `stats()` read zero,
+    nothing could ever signal it again, and the next `start()` spawned a full
+    complement *beside* it — two pools draining one queue, with the concurrency
+    ceiling this module exists to enforce quietly doubled.
+    """
+    monkeypatch.setattr(scheduler, "_MAX_WORKERS", 1)
+    gate = threading.Event()
+    worker = []
+    try:
+        _saturate(gate, n=1)
+        worker = [t for t in scheduler._workers if t.is_alive()]
+        assert len(worker) == 1, "premise broken — expected a single worker"
+
+        assert scheduler.shutdown(timeout=0.2) is False, (
+            "shutdown() claimed success while a worker was still running a turn"
+        )
+        assert scheduler.stats()["workers"] == 1, (
+            "the pool forgot a worker that is still running"
+        )
+        assert scheduler.start() is True
+        assert len([t for t in scheduler._workers if t.is_alive()]) == 1, (
+            "start() spawned a second worker beside one the pool had forgotten"
+        )
+    finally:
+        gate.set()
+
+    # The stop order it was given still applies once its turn returns.
+    worker[0].join(5)
+    assert not worker[0].is_alive(), (
+        "a busy worker never acted on the sentinel shutdown() left for it"
+    )
+
+
+def test_shutdown_does_not_hand_queued_work_to_the_next_pool():
+    """`_pending` and `_q` must describe the same queue.
+
+    `shutdown()` cleared `_pending` and left the jobs themselves in `_q`, so
+    `stats()["queued"]` read 0 while real turns were still waiting — and the next
+    pool ran them, seconds after their callers had been told they were gone.
+    """
+    gate = threading.Event()
+    ran = threading.Event()
+    try:
+        _saturate(gate)                      # every worker is busy on the gate
+        assert scheduler.submit(ran.set, sid="late") == scheduler.QUEUED
+        assert scheduler.stats()["queued"] >= 1, "premise broken — nothing queued"
+
+        scheduler.shutdown(timeout=0.2)
+        assert scheduler.stats()["queued"] == 0, (
+            "shutdown() cleared the pending list but left the job in the queue"
+        )
+        assert scheduler.stats()["cancelled"] >= 1, (
+            "the discarded turn was not accounted for anywhere"
+        )
+    finally:
+        gate.set()
+
+    assert scheduler.start() is True
+    time.sleep(0.3)
+    assert not ran.is_set(), (
+        "a turn shutdown() reported as discarded ran on the restarted pool"
+    )
+
+
+def test_a_stale_sentinel_cannot_outlive_a_shutdown(monkeypatch):
+    """A leftover `None` is a stop order aimed at whoever spawns next.
+
+    Draining the queue before signalling is what removes it. Without that, the
+    first worker of a fresh pool takes the previous pool's sentinel and exits
+    immediately — while `start()` reports a full complement, so the turn behind it
+    waits on a pool with nobody in it.
+    """
+    monkeypatch.setattr(scheduler, "_MAX_WORKERS", 1)
+    scheduler._q.put_nowait(None)
+    assert scheduler.shutdown() is True
+
+    assert scheduler.start() is True
+    ran = threading.Event()
+    assert scheduler.submit(ran.set, sid="s1") == scheduler.QUEUED
+    assert ran.wait(5), "a stale sentinel killed the restarted pool's only worker"

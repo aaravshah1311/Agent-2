@@ -11,6 +11,7 @@ from google.genai import types
 from agent2.config import OS_NAME, SHELL_LABEL
 from agent2.core import workspace as _ws
 from agent2.core import logging as alog
+from agent2.core import metrics as _metrics
 from agent2.core import permissions as _perms
 from agent2.core.workspace import WorkspaceViolation, BLOCKED_MSG
 
@@ -38,6 +39,39 @@ def _safe_path(raw: str, tool: str, *, require_exists: bool = False):
     if require_exists and not p.exists():
         return None, {"error": f"Not found: {p}"}
     return p, None
+
+
+def _safe_options(options: dict, tool: str):
+    """Confine every path-bearing key of a model-supplied options dict.
+
+    Returns (options, None) or (None, error_dict). WHICH keys name a path is
+    `fileintel.security`'s one declaration — this reads that table rather than
+    listing the keys a second time, so a plugin that starts honouring a new one
+    is covered by editing the table alone.
+    """
+    from agent2.fileintel.security import PATH_OPTIONS, PATH_LIST_OPTIONS
+    out = dict(options)
+    for key in PATH_OPTIONS:
+        v = out.get(key)
+        if isinstance(v, str) and v.strip():
+            p, err = _safe_path(v, tool)
+            if err:
+                return None, err
+            out[key] = str(p)
+    for key in PATH_LIST_OPTIONS:
+        v = out.get(key)
+        if not isinstance(v, (list, tuple)):
+            continue
+        cleaned = []
+        for item in v:
+            if not str(item).strip():
+                continue
+            p, err = _safe_path(str(item), tool, require_exists=True)
+            if err:
+                return None, err
+            cleaned.append(str(p))
+        out[key] = cleaned
+    return out, None
 
 
 def add_mem(content: str, importance: int = 5, tags=None) -> None:
@@ -173,6 +207,58 @@ def _impl_scan_project(args: dict) -> dict:
     file_tree = "\n".join(tree_lines)
     file_contents = "\n".join(contents) if contents else "No important text files found."
     return {"file_tree": file_tree, "file_count": len(contents), "project_contents": file_contents}
+
+
+def _impl_update_project_doc(args: dict) -> dict:
+    """Refresh `.agent2/agent2.md` after the project changed — the write half of
+    `/init`, offered to the agent so it can keep the doc it reads every turn true.
+
+    ⚠️ NOT A SECOND `/init`, NOT A SECOND WRITER. It calls `projectscan.scan()`
+    then `projectdoc.apply()` exactly as the `/init` command does — the same
+    marker-aware merge, so a human-owned section is preserved and an established
+    narrative is carried forward, never regenerated into a placeholder. The agent
+    is *why* the refresh runs; it is not a new way to build the file.
+
+    `describe` defaults to **False**: a mid-task refresh after Agent2 added a module
+    is a factual update (structure, tech stack, entry points), not a re-description,
+    and `projectdoc` now carries the model-written prose forward untouched. The
+    agent asks for `describe=True` only when it changed *what the project is for*.
+    A `hint` is the agent restating the project's purpose; absent, the one the doc
+    already recorded stands.
+
+    Totality: every failure is a returned `error`, never an exception — the model
+    reads errors and adapts. The `fs.write` gate lives in `projectdoc.apply()` and
+    is asked again there, so `AGENT2_DENY_CAPS=fs.write` stops this too.
+    """
+    from agent2.core import projectscan as _ps, projectdoc as _pd
+    from agent2.core import workspace as _wsmod
+    try:
+        root = str(_wsmod.root())
+    except Exception as ex:
+        return {"error": f"no workspace root: {type(ex).__name__}"}
+    rep = _ps.scan(root)
+    if not rep.get("root"):
+        return {"error": "could not analyse this workspace (no readable root)"}
+    hint = " ".join(str(args.get("hint") or "").split())
+    describe = bool(args.get("describe", False))
+    res = _pd.apply(rep, hint=hint, describe=describe)
+    if not res.get("ok"):
+        return {"error": res.get("reason") or "could not update the project doc",
+                "doc": res.get("doc", "")}
+    # A compact, content-free summary — what changed, never the prose that changed.
+    return {
+        "updated": True,
+        "doc": res.get("doc", ""),
+        "created": res.get("created", False),
+        "changed": res.get("changed", False),
+        "sections_updated": res.get("updated", []),
+        "sections_added": res.get("added", []),
+        "preserved": res.get("preserved", []),
+        "narrative_carried": res.get("narrative_carried", []),
+        "described": res.get("described", False),
+        "bytes": res.get("bytes", 0),
+    }
+
 
 def _impl_multi_edit(args: dict) -> dict:
     edits = args.get("edits", [])
@@ -385,7 +471,17 @@ def _impl_run_file_op(args: dict) -> dict:
             options = json.loads(options)
         except Exception:
             options = {}
-    return fileintel.run_op(str(sp), str(op), options)
+    if not isinstance(options, dict):
+        options = {}
+    # `options` carries paths too — output_path, output_dir, paths, other — and
+    # the plugins write to them. Send them through the SAME gate as `path`, so a
+    # model cannot reach outside the workspace through an option key that
+    # write_file and convert_file would both refuse.
+    options, oerr = _safe_options(options, "run_file_op")
+    if oerr:
+        return oerr
+    return fileintel.run_op(str(sp), str(op), options,
+                            workspace_root=str(_ws.root()))
 
 
 def _impl_convert_file(args: dict) -> dict:
@@ -404,7 +500,8 @@ def _impl_convert_file(args: dict) -> dict:
         if oerr:
             return oerr
         out = str(op)
-    return fileintel.convert_file(str(sp), str(to), output_path=out)
+    return fileintel.convert_file(str(sp), str(to), output_path=out,
+                                  workspace_root=str(_ws.root()))
 
 
 def _impl_search_workspace(args: dict) -> dict:
@@ -574,6 +671,7 @@ REGISTRY.register("web_search",       _impl_search)
 REGISTRY.register("save_memory",      _impl_save_mem)
 REGISTRY.register("emit_plan",        _impl_plan)
 REGISTRY.register("scan_project",     _impl_scan_project)
+REGISTRY.register("update_project_doc", _impl_update_project_doc)
 REGISTRY.register("multi_edit_files", _impl_multi_edit)
 REGISTRY.register("list_dir",         _impl_list_dir)
 REGISTRY.register("delete_file",      _impl_delete_file)
@@ -627,6 +725,46 @@ def dispatch_tool(name: str, args: dict, ctx: "ToolContext | None" = None) -> di
     the user as a crash, which is a worse description of "you asked for something
     this deployment does not allow". The check is a no-op unless an operator set
     `AGENT2_DENY_CAPS`, so the default install is untouched.
+
+    ⚠️ IT IS ALSO THE DURABLE-LEDGER CHOKEPOINT (Task 24)
+    ────────────────────────────────────────────────────
+    `execstate.tool_started`/`tool_finished` bracket the call so the *next*
+    process can see what was in flight. Two placements are load-bearing:
+
+    * **After the capability gate.** A refused tool never ran, so a row for it
+      would tell recovery to verify an operation that never happened — the
+      opposite of rule 29's intent.
+    * **Whether or not `ctx` exists.** `ctx.note_tool` returns immediately unless
+      a task session is RUNNING, so a destructive call made outside a task — which
+      is most of them — left no durable trace at all. That gap is the one
+      `database.py:956-961` names, and this pair is what closes it.
+
+    The ledger is *not* a second checkpoint: `ctx.note_tool` still owns the
+    in-session progress trail, and `execstate` owns cross-restart evidence
+    (pre/post digests of the paths the args name). Both calls are total — a
+    ledger that cannot be written returns quietly and the tool's real result is
+    still what this function returns.
+
+    ⚠️ IT IS ALSO THE TOOL-METRICS CHOKEPOINT (Task 27)
+    ──────────────────────────────────────────────────
+    `tool.latency` and `tool.failures` are measured here, labelled by tool name,
+    for the same reason the checkpoint and the ledger are: three loops call tools
+    and instrumenting each would give three windows on one fact. The timer wraps
+    `REGISTRY.call` **alone** — not the gate, not the checkpoint writes — so the
+    number means "how long the tool took", not "how long Agent2 took to decide it
+    was allowed to". A refused call is deliberately *not* timed and *not* counted
+    as a failure: it is a permission denial, `permission.denials` already owns it,
+    and counting it twice would make a locked-down deployment look broken.
+
+    ⚠️ AND A NAME THE REGISTRY DOES NOT HOLD IS NOT TIMED EITHER — its tally lands
+    under `metrics.UNKNOWN`. The label vocabulary of `tool.latency` is "the tools
+    this build has", a closed set of sixteen; a hallucinated tool name is
+    model-supplied text, and labels are created on first *observation*, not at
+    registration. Admit them and `MAX_SERIES` junk names arriving before the first
+    real `read_file` fold **the real tools** into `~other` for the life of the
+    process — a measurement destroyed by the thing it was measuring. The failure
+    itself is still counted, because a model calling a tool that does not exist is
+    a real failure; only the name is refused entry.
     """
     cap = _perms.capability_for_tool(name)
     if not _perms.process_allows(cap):
@@ -638,11 +776,61 @@ def dispatch_tool(name: str, args: dict, ctx: "ToolContext | None" = None) -> di
                          detail=_step_detail(name, args))
     if ctx is not None and name in _destructive_tools():
         ctx.note_tool(name, detail=_step_detail(name, args))
-    result = REGISTRY.call(name, args, ctx)
+    call_id = _exec_started(name, args, ctx)
+    known = REGISTRY.has(name)
+    if known:
+        with _metrics.timer(_metrics.TOOL_LATENCY, name):
+            result = REGISTRY.call(name, args, ctx)
+    else:
+        result = REGISTRY.call(name, args, ctx)
+    failed = not isinstance(result, dict) or "error" in result
+    if failed:
+        _metrics.incr(_metrics.TOOL_FAILURES,
+                      label=name if known else _metrics.UNKNOWN)
+    _exec_finished(call_id, ok="error" not in result,
+                   error=str(result.get("error") or "") if isinstance(result, dict) else "")
     if ctx is not None and name != "update_todo":
         ctx.note_tool(name, ok="error" not in result,
                       detail=_step_detail(name, args))
     return result
+
+
+def _exec_started(name: str, args: dict, ctx: "ToolContext | None") -> str:
+    """Open a durable row for this call, or return `""` (Task 24).
+
+    Lazily imported and totally swallowed for the same reason
+    `_destructive_tools()` is: `core.execstate` is not a dependency of the tool
+    layer, and a dispatch must never start failing because a bookkeeping import
+    did.
+
+    ⚠️ `surface` is INFERRED, and it is a heuristic, not a fact: `ToolContext` has
+    a `sid` only when a Socket.IO client is driving the turn, so a `sid` means web
+    and its absence means CLI. It is a display/report field — nothing branches on
+    it — which is why an inference is acceptable here and would not be in
+    `commands.py`, where the runner is told its own surface explicitly.
+    """
+    try:
+        from agent2.core import execstate as _exec
+        return _exec.tool_started(
+            name, args,
+            session_id=str(getattr(ctx, "_task_session_id", "") or "") if ctx else "",
+            chat_id=str(getattr(ctx, "chat_id", "") or "") if ctx else "",
+            surface=("web" if getattr(ctx, "sid", None) else "cli") if ctx else "",
+            target=_step_detail(name, args),
+        )
+    except Exception:
+        return ""
+
+
+def _exec_finished(call_id: str, *, ok: bool = True, error: str = "") -> None:
+    """Settle the durable row opened by `_exec_started` (Task 24)."""
+    if not call_id:
+        return
+    try:
+        from agent2.core import execstate as _exec
+        _exec.tool_finished(call_id, ok=ok, error=error)
+    except Exception:
+        pass
 
 
 def _destructive_tools() -> frozenset:
@@ -721,6 +909,23 @@ def _build_tools() -> types.Tool:
             parameters=S(type=T.OBJECT, properties={
                 "path": S(type=T.STRING),
             }, required=["path"])),
+        types.FunctionDeclaration(name="update_project_doc",
+            description=(
+                "Refresh this project's .agent2/agent2.md — the project document you are "
+                "given at the start of every turn. Call this AFTER you finish work that "
+                "changed what the project contains: a new feature, module, dependency, "
+                "entry point, test suite, build or run command, or a directory layout "
+                "change. It re-analyses the project and rewrites only the sections Agent2 "
+                "owns; sections a human wrote are preserved, and the existing description "
+                "is kept. Set describe=true ONLY if you changed what the project is FOR "
+                "(that costs an extra model call); leave it false for ordinary structural "
+                "changes. Pass hint only to restate the project's one-line purpose. "
+                "Do not call it after read-only work, or after edits that changed no "
+                "structure — an unchanged project rewrites nothing and reports changed=false."),
+            parameters=S(type=T.OBJECT, properties={
+                "describe": S(type=T.BOOLEAN),
+                "hint": S(type=T.STRING),
+            })),
         types.FunctionDeclaration(name="multi_edit_files",
             description="Edit multiple files at once by replacing exact text snippets. Each edit has path, old_text (exact match), new_text (replacement). Use for renaming, refactoring, or patching across files.",
             parameters=S(type=T.OBJECT, properties={

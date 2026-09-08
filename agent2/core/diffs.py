@@ -376,6 +376,92 @@ def compute_change(path: str, before: str | None, after: str | None) -> FileChan
     return ch
 
 
+# ── Undoing a change ──────────────────────────────────────────────────────────
+# ⚠️ THE BEFORE-SIDE OF A WINDOWED DIFF IS NOT THE FILE. `ch.lines` is an `n=3`
+# unified diff, so `[t for tag, t in ch.lines if tag in ("del", "ctx")]` is the
+# whole pre-change file only when every line of it happened to fall inside a hunk.
+# That reconstruction shipped in `cli/diffview.revert_change`, and on a 200-line
+# file with one changed line it wrote 7 lines to disk and returned True.
+# `ch.truncated` cannot catch it: that flag means "past MAX_DIFF_LINES *rendered*
+# rows", not "elided", and it is False for every ordinary diff. So an undo
+# reverse-applies the hunks to the file ON DISK — the parts a windowed diff never
+# captured are then the parts it never touches.
+#
+# The computation lives here because `core/diffs.py` is the one home for reading a
+# diff (the one-declaration rule); `cli/diffview.revert_change` is the disk actor.
+
+def hunks_of(ch: FileChange) -> list[tuple[int, int, list[str], list[str]]] | None:
+    """Split `ch.lines` into `(old_start, new_start, before_rows, after_rows)`.
+
+    `None` means the rows cannot be read as hunks: an unparseable `@@` header, a
+    row before the first header, a tag this reader does not know, or no hunks at
+    all. ⚠️ Every caller must treat that as *refuse*, never as *nothing to do* —
+    the one consumer writes to disk.
+    """
+    out: list[tuple[int, int, list[str], list[str]]] = []
+    cur: tuple[int, int, list[str], list[str]] | None = None
+    for tag, text in ch.lines:
+        if tag == "hunk":
+            old, new = _parse_hunk(text)
+            if old is None or new is None:
+                return None
+            cur = (old, new, [], [])
+            out.append(cur)
+            continue
+        if cur is None:
+            return None                     # a row before any `@@` header
+        if tag == "ctx":
+            cur[2].append(text)
+            cur[3].append(text)
+        elif tag == "del":
+            cur[2].append(text)
+        elif tag == "add":
+            cur[3].append(text)
+        else:
+            return None                     # a tag this reader does not know
+    return out or None
+
+
+def revert_text(ch: FileChange, current: str) -> str | None:
+    """The file as it was before *ch*, or None when that cannot be established.
+
+    Reverse-applies each hunk to *current*: find the hunk's after-side, put its
+    before-side back. Hunks are applied LAST-FIRST, so the earlier ones still sit
+    at the offsets their own headers were written against.
+
+    ⚠️ EVERY HUNK IS VERIFIED AGAINST *current* BEFORE ANYTHING IS RETURNED, AND
+    ONE MISMATCH REFUSES THE WHOLE UNDO. The after-side is what the file is
+    supposed to look like right now, so a mismatch means the file moved on — an
+    `[E]` round trip in the viewer, another turn's write, a hand edit — and
+    reverting against a file we no longer recognise is how an undo becomes a
+    second corruption. Nothing is written here, so the refusal is atomic by
+    construction: this returns a string or None and the caller owns the write.
+    """
+    hunks = hunks_of(ch)
+    if hunks is None:
+        return None
+    lines = current.splitlines(keepends=False)
+    for _old_start, new_start, before_rows, after_rows in reversed(hunks):
+        # A hunk with no after-side is a whole-file deletion. difflib writes
+        # `@@ -1,15 +0,0 @@` for it (`_format_range_unified` does `beginning -= 1`
+        # when the length is 0), so the number names an insertion POINT and is
+        # already the index. Every other header points at a real 1-based line.
+        idx = (new_start - 1) if after_rows else new_start
+        if idx < 0 or idx + len(after_rows) > len(lines):
+            return None
+        if lines[idx:idx + len(after_rows)] != after_rows:
+            return None
+        lines[idx:idx + len(after_rows)] = before_rows
+    if not lines:
+        return ""
+    # A trailing newline is not representable in the diff (`lineterm=""` over
+    # `splitlines`), so follow the file in hand — and a file that is absent or
+    # empty (an undone delete) gets one, which is what every other writer here
+    # produces.
+    tail = "\n" if (current.endswith("\n") or not current) else ""
+    return "\n".join(lines) + tail
+
+
 # ── Capture helpers (called BEFORE the tool runs) ──────────────────────────────
 # These are the whole reason this module exists. Each reads the file as it is
 # RIGHT NOW and pairs it with what the tool is about to write.

@@ -182,40 +182,150 @@ Inspect what each model can do with `/model caps`. It prints three values, and
 
 ## ⌨️ CLI command reference
 
-All 29 commands. `/help` prints the same table, and `F1` opens it.
+All **36** commands. `/help` prints the same table, and `F1` opens it. The table
+below and the help screen are the same list — `cli/render.SLASH_COMMANDS` is the
+one declaration, which also feeds the `/` autocomplete.
 
 | Command | Description |
 |---------|-------------|
 | `/help` | Show all commands |
-| `/addapi` · `/keys` | Add a Gemini key · show key status and usage. Keys, usage counters and the pin are shared with the Web UI — add a key in one and the other sees it |
-| `/model [name\|auto]` · `/mode [name]` | Switch model · switch reasoning mode |
+| `/addapi` · `/keys` | Add a Gemini key · activate a key or provider with `↑/↓`. Keys, usage counters and the pin are shared with the Web UI — add a key in one and the other sees it |
+| `/model [name\|auto]` · `/mode [name]` | Switch model · switch reasoning mode. `auto` lets Agent2 pick per turn |
 | `/model routing [off\|default_only\|always]` | Show or set when automatic routing applies |
-| `/model caps [<model>] [field=value …]` | Show or correct a model's capability record |
+| `/model caps [<model>] [field=value …]` | Show or correct a model's capability record. Unknown prints `?`, never "no" |
 | `/model rank [<model>\|all] [force]` | Ask a model to classify an unrecognised model id |
 | `/provider [add\|list\|use\|del\|test]` | Manage custom model providers |
 | `/mcp` | Ephemeral menu of every MCP server — `↑↓` · `Space` · `Enter` · `Esc` |
 | `/mcp status` · `/mcp health` | Print every server · a `✓`/`✗` report with **[R]** Retry and **[S]** Settings |
-| `/mcp <server> connect\|disconnect\|list\|status\|config` | One server. `config` edits url · port · security key |
+| `/mcp <server> connect\|disconnect\|reconnect\|list\|status\|config\|health` | One server. `config` edits url · port · security key |
 | `/mcp connect` · `/mcp disconnect` | Every server at once |
-| `/settings` (`/config`) | One menu onto every settings area — model · mode · theme · colour · rules · offline · MCP · keys |
+| `/settings` (`/config`) | One menu onto every settings area — model · mode · theme · colour · rules · skills · offline · MCP · keys |
 | `/rules` | Activate or deactivate the rules injected into every system prompt |
+| `/skills …` | Skills from `.agent2/skills/` — bare `/skills` opens the menu · `list` · `on` · `off` · `reset <name>` · `show <name>` · `last` · `reload` |
+| `/workflow …` | Workflows from `.agent2/workflows/` — bare `/workflow` opens the menu · `list` · `new` · `edit` · `run` · `auto <goal>` · `delete` · `show` · `state` · `reload` |
+| `/ultracode …` | The adaptive autonomous loop — `start <goal>` · `run` · `approve` · `state` · `cancel` · `policy` |
 | `/offline` | Which subsystems may reach the network |
 | `/theme` · `/color` | CLI colour theme · accent colour |
-| `/workspace` · `/cd <dir>` | Show or change where the agent is rooted |
-| `/memory` · `/addmem <text>` | List saved memories · save one manually |
-| `/scan [path]` · `/read <file>` · `/run <cmd>` | Scan a project · read a file · run a shell command |
+| `/workspace [path]` · `/cd <dir>` | Show or change where the agent is rooted. Switching cancels running tasks |
+| `/init [about]` | Analyse **this workspace** and create or update `.agent2/agent2.md`. Free text after the command is your own description and outranks the model's guess |
+| `/scan <path>` · `/read <file>` · `/run <cmd>` | Analyse a directory for this turn · read a file · run a shell command |
 | `/search <query>` | Web search via DuckDuckGo |
-| `/tasks` · `/pause` · `/resume` | Background work: list it, pause it, pick it up again |
-| `/load` | Reload the last conversation from **this** directory |
-| `/history` · `/clearhistory` | Show the transcript · wipe it |
+| `/memory` · `/addmem <text>` | List saved memories · save one manually |
+| `/tasks` · `/recovery …` | The persistent task list · what a killed run left behind (`scan` · `ack`\|`retry`\|`kill <kind> <id>`) |
+| `/health` · `/metrics [reset]` | Is it working (`✓/⚠/✗/○` per subsystem) · how fast, how often, how big |
+| `/load` | Load the last conversation from **this** directory |
+| `/pause` · `/resume` | Pause this conversation · pick a previous one back up with a `↑/↓` picker across all projects |
+| `/history` · `/clearhistory` | Show the last 10 messages · wipe the history |
 | `/clear` · `/shrink` | Clear the screen · summarize and shrink the context |
 | `/exit` | Quit |
 
 `/burp …` still works and **forwards** to `/mcp burp …`, printing where it went —
-it is retired from the help table but never silently removed.
+it is retired from the help table but never silently removed. There is
+deliberately **no `/mcp auto`**: auto-connect is written as a side effect of
+`connect`/`disconnect` and of the bare `/mcp` menu, and the explicit setter
+(`POST /api/mcp/<key>/auto`) is web-only.
 
-**Keybindings:** `Ctrl+B` diff viewer · `Ctrl+P` command palette · `Ctrl+T`
-terminal · `F1` help · `Ctrl+L` clear.
+**Keybindings — all nine:** `Ctrl+B` diff viewer · `Ctrl+P` command palette ·
+`Ctrl+L` clear the screen · `Ctrl+R` reverse-search the input history · `Ctrl+T`
+running and queued tasks · `Ctrl+K` cancel the current task · `Esc` close an
+overlay or cancel the turn · `Tab` accept the autocomplete suggestion · `F1` this
+help.
+
+### `/init` — teaching Agent2 what your project is
+
+`/init` walks the workspace and writes `.agent2/agent2.md`: what the project is,
+its languages, package managers (each with the lockfile that proved it),
+frameworks, entry points, tests and the runners actually proved, build system, dev
+and test commands, and the notes its own source files carry about themselves. It
+also creates `.agent2/skills/`.
+
+Two things make it worth running early. The file is read back into **every later
+prompt**, so the agent knows your architecture before it acts. And a rerun never
+overwrites a section you took over — ownership is a marker on a section's first
+body line, so deleting the marker makes that section yours forever.
+
+```bash
+/init this is a project of calculator   # your description outranks the model's guess
+/init                                   # a rerun recovers what you typed the first time
+```
+
+`/scan <path>` is the other half and it writes nothing: it analyses one directory
+and feeds that to the model for this turn. `/init` writes the file; `/scan`
+answers a question.
+
+### `/skills` — instruction files that apply per request
+
+Drop a `SKILL.md` (or `AGENTS.md`, `GEMINI.md`, and seven other manifest names)
+under `.agent2/skills/` and Agent2 picks the relevant ones **per message** — not
+all of them into every prompt. At most four reach one prompt, inside a 6 000-char
+share, and `/skills last` tells you exactly which applied and why each of the rest
+did not.
+
+`/skills` is a **block list, not a force list.** Switching something ON means
+"stop blocking it", which restores automatic selection; switching it OFF beats
+every signal including a message that names the skill. Nothing here ever edits a
+skill file — your choice is a row in `agent2.db`, scoped to this project, because
+a skill is usually somebody else's file in somebody else's repository.
+
+### `/workflow` — a plan as a graph
+
+Write `.agent2/workflows/<name>.yaml` (or `.json`) and `/workflow run <name>`
+validates it, builds the DAG, **shows you the plan**, and only then runs it. Bare
+`/workflow` executes nothing — it opens the menu.
+
+```bash
+/workflow list                  # what this project has, including files that will not run
+/workflow show build-and-test   # nodes, order, problems
+/workflow run build-and-test    # validate → build the DAG → show the plan → run
+/workflow auto "add rate limiting to the login route"
+/workflow state                 # the live run, the waves, what starts next
+```
+
+`/workflow auto <goal>` turns a sentence into a graph. It **draws the plan before
+writing anything** — no run row, no task rows — and then asks; *Plan only* is the
+default answer, so Esc means "you already showed me". `/workflow state` is also
+where interrupted work is released: asking what is running un-sticks what a dead
+process parked, and it **names the nodes** it released.
+
+The filename is the workflow's name. A `name:` line inside the file that disagrees
+is reported, and the filename wins. PyYAML is not a dependency, so the parser
+declares the subset it reads and anything outside it is listed as unsupported
+rather than guessed at — and a file written for an older schema still runs, with a
+note saying it was upgraded on the way in.
+
+### `/ultracode` — the autonomous loop
+
+UNDERSTAND → INSPECT → DISCOVER SKILLS → PLAN → EXECUTE → OBSERVE → ANALYZE →
+VERIFY, and on a failed verify: RE-PLAN → EXECUTE. Six verbs:
+
+```bash
+/ultracode start "make the CLI resume the last conversation by default"
+/ultracode state      # the stage, the nodes, what is holding it
+/ultracode approve    # release the gate
+/ultracode run        # drive the loop
+/ultracode cancel
+/ultracode policy     # every ceiling, and whether approval is on
+```
+
+Bare `/ultracode` reports and runs nothing. An unknown first word is **refused,
+never read as a goal** — `/ultracode fix the login bug` is indistinguishable from
+a verb this build lacks, and guessing would turn a typo into a planner call and a
+graph of task rows.
+
+Two things are worth knowing before you use it. **Approval is on by default and
+the gate is a graph node**, not a prompt: it is created paused with everything
+depending on it, so the hold survives a crash and nothing can helpfully release it
+for you. And **verification is a node too** — it asks the durable record whether
+each step's commands exited zero and its writes actually landed, never a model.
+"Done" is not verification.
+
+> ⚠️ **`/ultracode run` is terminal-only, and the browser panel says so rather
+> than hiding it.** Driving the loop needs a synchronous worker that owns a whole
+> model turn, and a web request thread has neither the socket id nor the stream.
+> Nothing is lost: the browser's next ordinary chat turn does that work, because
+> the current node reaches the prompt either way. `work`, `replan` and `finalize`
+> are verbs on **neither** surface — the driver owns all three and the order they
+> run in.
 
 ### Reviewing what changed — `Ctrl+B`
 
@@ -434,7 +544,41 @@ Sensible defaults; nothing here needs setting.
 | `AGENT2_SECRET_KEY_FILE` | `~/.agent2/secret.key` | Where the master key lives. Keep it out of the database directory |
 | `AGENT2_LOG_DIR` | `<db dir>/logs` | Put every log somewhere else — a mounted volume, for instance |
 
-The full table — all 61 variables with their real defaults — is in
+### Bounding the graph family
+
+Skills, workflows, the DAG, dynamic planning and UltraCode each have a master
+switch and their own ceilings. Every one of them is **reported when it engages** —
+a truncated answer never reads as a complete one.
+
+| Var | Default | Why you'd change it |
+|-----|---------|---------------------|
+| `AGENT2_SKILLS` | `1` | `0` for an empty catalog and a skills block that collects nothing. `/skills` still reads the folder and names the switch, rather than showing a list nothing will use |
+| `AGENT2_SKILLS_IN_PROMPT` | `4` | How many skills may reach **one** prompt. This is the number "not every skill in every prompt" is measured against |
+| `AGENT2_SKILLS_MAX_CHARS` | `6000` | The share skills may ask for *before* the context budget sees them, so one enormous skill cannot arrive having already displaced the conversation |
+| `AGENT2_WORKFLOWS` | `1` | `0` and no run may be instantiated; the `workflow_state` context block collects nothing |
+| `AGENT2_WORKFLOW_MAX_NODES` | `64` | Nodes one workflow may declare. **Refused, never truncated** — a graph missing its last node is a graph whose dependencies no longer close |
+| `AGENT2_WORKFLOW_STATE_CHARS` | `1200` | What the live-run context block may spend. Small on purpose: the turn needs the *current* node, and the rest are named rather than inlined |
+| `AGENT2_DAG_MAX_NODES` | `512` | The outer wall for any consumer. A workflow is still bounded by its own 64 |
+| `AGENT2_DAG_MAX_MUTATIONS` | `64` | Nodes a **live** graph may gain after it was declared. `0` is a supported answer — *plan once and never invent more work* |
+| `AGENT2_DAG_MAX_WORKERS` | `4` | Threads the pump runs nodes on. `0` is supported: nodes run inline, one at a time |
+| `AGENT2_DAG_MAX_RUNNING` | `8` | Nodes in flight at once, whatever kind. Derived from the rows, so it counts the other process's claims in dual mode |
+| `AGENT2_DAG_MAX_COMMANDS` · `_MCP_CALLS` | `2` · `2` | Shell nodes · MCP calls in flight together. Small deliberately — eight commands racing for one terminal makes output unreadable, and a bridge is one instance of somebody else's program |
+| `AGENT2_DAG_MAX_MODEL_CALLS` | `200` | The **lifetime** spend of one run on model-backed nodes. Charged from attempt counts, so a retry is charged and a crash-resumed run gets no fresh allowance |
+| `AGENT2_DAG_MAX_ATTEMPTS` | `2` | Times one node may be started, retries included. Bounded **and** classified — whether repeating *this* operation is safe at all is a separate question, asked first |
+| `AGENT2_DAG_NODE_TIMEOUT` | `0` (off) | Off for `AGENT2_CMD_TIMEOUT`'s reason: a node may legitimately be a 40-minute build |
+| `AGENT2_DYNAMIC_WORKFLOW` | `1` | `0` turns off the **planner** only. A workflow file you wrote still runs — this is a statement about who may author a graph |
+| `AGENT2_DYNAMIC_MAX_STEPS` | `24` | Steps one generated plan may contain. **Clipped and reported**, the opposite of a file's node ceiling, because refusing would throw away a usable plan for being wordy |
+| `AGENT2_DYNAMIC_MAX_ROUNDS` | `3` | Times one run may be handed back to a planner. Not the same ceiling as mutations: twenty single-node additions sit far under 64 while being exactly the runaway it exists to stop |
+| `AGENT2_ULTRACODE` | `1` | `0` turns off the autonomous **driver**. `/workflow run` and `/workflow auto` still work |
+| `AGENT2_ULTRACODE_MAX_CYCLES` | `6` | Execute→verify→re-plan cycles one run may spend. A cycle that fixes something without asking a planner spends no round at all |
+| `AGENT2_ULTRACODE_BUDGET_SEC` | `0` (off) | Off by default, and checked **between cycles** — reported, never enforced by killing a worker mid-write |
+| `AGENT2_ULTRACODE_APPROVAL` | `1` | `0` builds the graph without the approval gate. It does **not** widen what a node may do — every action still goes through the capability gate when it runs |
+| `AGENT2_VERIFY_MAX_ROWS` | `500` | The one knob verification has. There is deliberately **no `AGENT2_VERIFY=0`**: verification off would not make Agent2 quieter, it would make it credulous |
+| `AGENT2_RESUME` | `off` | `last` to continue the previous conversation on every launch. Off by default because an unasked resume rewrites a transcript you never meant to open |
+| `AGENT2_CONTEXT_ISOLATION` | `project` | `off` to pool memories and rules across every checkout instead of scoping them here |
+| `AGENT2_METRICS` | `1` | `0` and every measurement point becomes a single boolean test |
+
+The full table — all **116** variables with their real defaults — is in
 [the documentation](https://agent2.is-best.net/docs/env/).
 
 ---
@@ -475,7 +619,34 @@ keys, no chat text, no file paths), so it is safe to point a monitor at.
 Two things it deliberately does **not** call unhealthy: an optimization you
 switched off on purpose (`AGENT2_WAL_CHECKPOINT_SEC=0`,
 `AGENT2_MAX_CONCURRENT_TURNS=0`), and a worker pool showing zero workers on a
-server that hasn't handled a turn yet — those start on first use.
+server that hasn't handled a turn yet — those start on first use. A disabled
+subsystem reports `○ off`, which is not a lesser `⚠ warn`; a cross printed at a
+deliberate choice is how an alert stops being read.
+
+In the CLI, `/health` prints the same verdicts — one `✓/⚠/✗/○` row per subsystem,
+then the `problems` and `warnings` lines, which are the actionable half. There is
+one assembly behind both surfaces, so the terminal and a monitor cannot disagree
+about what "healthy" means. Fourteen subsystems are covered (the list expands to
+sixteen rows, one per MCP server and one each for Gemini and custom providers):
+
+```
+/health          # is it working
+/metrics         # how fast, how often, how big
+/metrics reset   # clear this process's window — only when asked
+```
+
+`/metrics` is a **separate command on purpose.** It answers a different question —
+thirteen signals with count, average, p50, p95 and max: model latency and tokens,
+tool latency and failures, command duration, queue wait, task and workflow
+duration, memory retrieval, context size, MCP latency, permission denials. Folding
+it into `/health` would put a percentile next to a fault and invite you to read one
+as the other.
+
+Three of those thirteen are **borrowed rather than measured here** — model latency,
+model errors and permission denials belong to the router and the permission gate,
+which record them durably and install-wide. The other ten are in-memory and
+per-process, which the payload's `scope` field states: in dual mode "since when"
+means "since this process started".
 
 ---
 
@@ -485,7 +656,7 @@ server that hasn't handled a turn yet — those start on first use.
 |---|---|
 | [`README.md`](README.md) | The short tour and the architecture map |
 | [`FEATURES.md`](FEATURES.md) | The full inventory — every subsystem, every counted number, and what is *not* built |
-| [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) | 39 pages, each load-bearing rule stated together with the bug it prevents |
+| [**agent2.is-best.net/docs**](https://agent2.is-best.net/docs/) | 45 pages, each load-bearing rule stated together with the bug it prevents |
 | [`CLAUDE.md`](CLAUDE.md) | The index of every invariant and the file that owns it — read this before changing one |
 
 Two things worth knowing before you rely on anything here. First, several rules in

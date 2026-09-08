@@ -162,6 +162,15 @@ register_sockets(socketio)
 from agent2.core import sync as _sync
 _sync.poller.start()
 
+# Crash recovery (Task 25 §1). ⚠️ AFTER the DB and the routes, BEFORE the server
+# binds: the scan reads `exec_*` rows a killed process left behind, and it must
+# have settled them before a browser can ask `/api/recovery` what happened.
+# `scan_on_start()` owns the "inline or background" decision for all three
+# surfaces, so this call site cannot be the one that blocks a launch — a large
+# backlog goes to a daemon thread there, not here.
+from agent2.core.recovery import crash as _crash
+_crash.scan_on_start()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🖥️ Frontend

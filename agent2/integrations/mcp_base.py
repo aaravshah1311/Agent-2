@@ -62,6 +62,8 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
+from agent2.core import metrics as _metrics
+
 # `google.genai` is always installed; `mcp` may be absent on very old installs.
 try:
     from google.genai import types as _gtypes
@@ -686,7 +688,17 @@ class McpBridge:
     # ── tool invocation ─────────────────────────────────────────────────────────
 
     def call_tool(self, name: str, args: dict, timeout: float = 60.0) -> dict:
-        """Invoke an MCP tool synchronously. Returns a normalised dict."""
+        """Invoke an MCP tool synchronously. Returns a normalised dict.
+
+        ⚠️ IT IS ALSO WHERE `mcp.latency` IS MEASURED (Task 27), labelled by
+        SERVER_KEY and not by tool name: a scanner exposes dozens of tools and one
+        of them is a full active scan, so per-tool labels would be unbounded in
+        practice while answering a question nobody asked — "is this bridge slow"
+        is the one an operator has. The timer covers the round trip *including* a
+        timeout, because a bridge that times out at 60 s is precisely the case the
+        number exists to surface; the two early returns above are not timed, since
+        a disconnected bridge did not take any time, it simply refused.
+        """
         if not self.is_connected():
             return {"error": f"Not connected to {self.LABEL} MCP. "
                              "Ask the agent to connect first."}
@@ -694,20 +706,21 @@ class McpBridge:
         loop = self._loop
         if loop is None:
             return {"error": f"{self.LABEL} MCP loop is not running."}
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._call_async(real, args or {}), loop
-            )
-            return fut.result(timeout=timeout)
-        except FuturesTimeout:
-            fut.cancel()
-            return {"error": (
-                f"{self.LABEL} tool '{real}' timed out after {timeout:.0f}s. "
-                f"{self.LABEL} may be waiting on the target or the request is slow."
-            )}
-        except Exception as exc:
-            detail = _root_cause(exc) or exc.__class__.__name__
-            return {"error": f"{self.LABEL} tool '{real}' failed: {detail}"}
+        with _metrics.timer(_metrics.MCP_LATENCY, self.SERVER_KEY):
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._call_async(real, args or {}), loop
+                )
+                return fut.result(timeout=timeout)
+            except FuturesTimeout:
+                fut.cancel()
+                return {"error": (
+                    f"{self.LABEL} tool '{real}' timed out after {timeout:.0f}s. "
+                    f"{self.LABEL} may be waiting on the target or the request is slow."
+                )}
+            except Exception as exc:
+                detail = _root_cause(exc) or exc.__class__.__name__
+                return {"error": f"{self.LABEL} tool '{real}' failed: {detail}"}
 
     async def _call_async(self, real_name: str, args: dict) -> dict:
         session = self._session

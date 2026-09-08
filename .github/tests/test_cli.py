@@ -424,6 +424,213 @@ def test_every_advertised_tool_is_dispatchable(monkeypatch):
     assert not unroutable, f"advertised but not dispatchable: {unroutable}"
 
 
+# ⚠️ The two by-design absences, named here with their reason rather than left as
+# silent omissions. A tool missing from a list for a REASON and a tool missing by
+# accident are indistinguishable unless the reason is written down — which is how
+# five File Intelligence tools stayed unadvertised in the CLI for a whole phase.
+_EXEC_STREAMED = frozenset(("run_command",))
+"""Advertised on every surface, dispatched by none: `terminal.stream_command` and
+`cli/runtime.run_cmd_stream` own it, because it streams and carries its own exec
+gate. See CLAUDE.md: '`run_command` goes through `terminal.stream_command`; all
+others through `tools.dispatch_tool`.'"""
+
+_CLI_PRESENTATION = frozenset(("web_search", "save_memory", "emit_plan"))
+"""Dispatched by the CLI itself, not delegated to `agent2.tools`: these three
+PRINT into this terminal, so routing them through the shared dispatcher would
+change what the user sees. Hence absent from `_SHARED_TOOLS` and present in
+`_build_tools()` — the frozenset's own comment says so."""
+
+
+def test_advertised_and_dispatchable_tools_agree_both_ways():
+    """⚠️ THE NAME SETS, IN BOTH DIRECTIONS — not one name, and not one direction.
+
+    `test_every_advertised_tool_is_dispatchable` above pins *advertised ⇒
+    dispatchable*: a name the model is promised that cannot be routed. This pins
+    the mirror, *dispatchable ⇒ advertised*, and the mirror is the half that had
+    already failed: `detect_file`, `file_capabilities`, `run_file_op`,
+    `convert_file` and `search_workspace` were in `_SHARED_TOOLS` — fully routable
+    from the terminal — and declared in NEITHER the CLI's Gemini schema nor
+    (`emit_plan`) the provider schema. Nothing errors in that state. The model is
+    simply never told, so it never calls, and the File Intelligence System was
+    unreachable from the DEFAULT surface while the browser used it freely.
+
+    ⚠️ It asserts on SETS because the per-name version already existed and did not
+    help: `test_init.py::test_the_tool_is_advertised_dispatchable_and_rated_fs_write`
+    walks all six lists correctly for `update_project_doc` alone, so it was green
+    throughout. A guard written per tool only ever covers the tool whose phase
+    wrote it; the invariant is that the sets agree.
+
+    ⚠️ NAMES ONLY — never descriptions. Five of the thirteen shared declarations
+    already word themselves differently in `tools.py` and `cli/tooling.py`, which
+    is deliberate (presentation is each surface's own, the same posture as the diff
+    `└ Added N …` row). Pinning prose here would freeze that and force one surface
+    to adopt the other's wording on the next edit.
+    """
+    from agent2.agent import _LOCAL_TOOLS
+    from agent2.llm.providers import agent_tool_schema
+    from agent2.tools import REGISTRY, _build_tools as _web_tools
+
+    web = {f.name for f in _web_tools().function_declarations}
+    cli_schema = {f.name for f in cli._build_tools().function_declarations}
+    prov = {t["name"] for t in agent_tool_schema()}
+
+    assert web, "no tools advertised — tools._build_tools() returned nothing"
+
+    # 1. The three model-facing schemas advertise ONE name set. A tool that exists
+    #    on one surface and not another is the bug, whichever surface is missing it.
+    assert cli_schema == web, (
+        "CLI and web Gemini schemas disagree; "
+        f"CLI-only={sorted(cli_schema - web)} web-only={sorted(web - cli_schema)}")
+    assert prov == web, (
+        "custom-provider schema disagrees with the Gemini schemas; "
+        f"provider-only={sorted(prov - web)} missing={sorted(web - prov)}")
+
+    # 2. Dispatchable ⇒ advertised, on both surfaces. This is the direction that
+    #    was open, and the one no amount of manual testing surfaces.
+    cli_routable = set(cli._SHARED_TOOLS) | _CLI_PRESENTATION
+    assert cli_routable <= cli_schema, (
+        "dispatchable from the CLI but never advertised to the model: "
+        f"{sorted(cli_routable - cli_schema)}")
+    assert set(_LOCAL_TOOLS) <= web, (
+        "dispatchable on the web surface but never advertised: "
+        f"{sorted(set(_LOCAL_TOOLS) - web)}")
+    assert set(_LOCAL_TOOLS) <= prov, (
+        "custom providers can dispatch it and are never told it exists: "
+        f"{sorted(set(_LOCAL_TOOLS) - prov)}")
+
+    # 3. Advertised ⇒ dispatchable, as sets, and the residue is EXACTLY the two
+    #    documented exemptions — so a third one cannot be added silently.
+    assert web - set(_LOCAL_TOOLS) == _EXEC_STREAMED, (
+        "advertised on the web surface but not in _LOCAL_TOOLS, and not the known "
+        f"streamed exemption: {sorted(web - set(_LOCAL_TOOLS) - _EXEC_STREAMED)}")
+    assert cli_schema - cli_routable == _EXEC_STREAMED, (
+        "advertised in the CLI but not routable, beyond the streamed exemption: "
+        f"{sorted(cli_schema - cli_routable - _EXEC_STREAMED)}")
+    assert _CLI_PRESENTATION.isdisjoint(cli._SHARED_TOOLS), (
+        "a CLI-presentation tool was delegated to the shared dispatcher — it would "
+        "stop printing into this terminal")
+
+    # 4. Registry and dispatch table are the same fact.
+    assert set(REGISTRY.list()) == set(_LOCAL_TOOLS), (
+        f"REGISTRY and _LOCAL_TOOLS disagree: {sorted(set(REGISTRY.list()) ^ set(_LOCAL_TOOLS))}")
+
+
+# ⚠️ Named here rather than inlined, so a future addition has to argue with a
+# sentence. Every one of these reaches the filesystem without passing through
+# `agent2.tools._safe_path`, which is the only place `_ws.validate_path` runs.
+_FS_CALLS = frozenset((
+    "open", "walk", "scandir", "listdir", "iterdir", "glob", "rglob",
+    "read_text", "write_text", "read_bytes", "write_bytes", "readlines",
+    "mkdir", "makedirs", "unlink", "remove", "rmtree", "rename", "replace",
+))
+
+
+def test_cli_tooling_performs_no_filesystem_operation():
+    """⚠️ THE ONE-BACKEND CLAIM IS AN ABSENCE, SO IT IS ASSERTED AS ONE.
+
+    `cli/tooling.py`'s docstring has always said every sandbox-sensitive tool is
+    routed to `agent2.tools` because "re-implementing a shared tool here would
+    give the CLI a second sandbox with its own bugs". It was false for a whole
+    phase: `_impl_read`, `_impl_write`, `_impl_scan_project` and
+    `_impl_multi_edit` sat in that module doing
+    `Path(args["path"]).expanduser()` and bare `open()`/`write_text()`.
+
+    ⚠️ Three of the four were unreachable — `dispatch_tool` tests
+    `_SHARED_TOOLS` first and all four names are in it — and that is precisely
+    why nothing could go red. `_impl_read` was the live one, reached from the
+    `/read` slash command, and through it a human-facing filesystem read skipped
+    all four things the shared backend exists to provide: `_ws.validate_path`
+    confinement, the `read_file` capability gate (`AGENT2_DENY_CAPS` describes
+    this whole process, CLI included), the `alog.tool_exec` audit line, and the
+    documented 100 000-char cap — the local copy had its own 64 000.
+
+    ⚠️ Pinned as "no filesystem call in this module" rather than "those four
+    functions are gone", because the defect is re-creatable under any name. A
+    fifth `_impl_*` doing its own `open()` is the same bug with a new spelling.
+
+    ⚠️ AST, never source text. This repo has been bitten twice by tautologies
+    that matched their own docstring: the paragraph above *names* `open()` and
+    `write_text`, so a `"open(" in source` test would fail on the comment that
+    explains why it exists.
+    """
+    import ast
+    import inspect
+
+    tooling = importlib.import_module("agent2.cli.tooling")
+    tree = ast.parse(inspect.getsource(tooling))
+
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+            if name in _FS_CALLS:
+                offenders.append(f"line {node.lineno}: {name}(…)")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = node.module if isinstance(node, ast.ImportFrom) else ""
+            names = [a.name for a in node.names]
+            # A `Path` here is a path THIS module resolved, which is the step that
+            # bypassed the sandbox. `shutil` has no other purpose at all.
+            if mod == "pathlib" or "pathlib" in names or "shutil" in names:
+                offenders.append(f"line {node.lineno}: imports {mod or names}")
+
+    assert not offenders, (
+        "agent2/cli/tooling.py touched the filesystem — that is a second sandbox "
+        "with its own bugs, which is exactly what the module docstring forbids. "
+        "Route it through agent2.tools instead: " + "; ".join(offenders))
+
+    # The four that shipped, gone from the module AND from the entry point's
+    # re-export surface: a stray `from agent2cli import _impl_write` is how an
+    # unconfined path comes back.
+    for gone in ("_impl_read", "_impl_write", "_impl_scan_project", "_impl_multi_edit"):
+        assert not hasattr(tooling, gone), f"agent2.cli.tooling.{gone} is back"
+        assert not hasattr(cli, gone), f"agent2cli re-exports {gone}"
+
+
+def test_read_slash_command_goes_through_the_shared_backend():
+    """⚠️ A HUMAN-FACING COMMAND THAT PERFORMS A GATED OPERATION STILL ASKS THE GATE.
+
+    `/read` is the CLI's one filesystem read outside a turn. The repo's own
+    precedent settles what that means: `run_command` skips `dispatch_tool`, so
+    `terminal.stream_command` and `cli/runtime.run_cmd_stream` each carry their
+    own exec gate rather than trusting that an operator typed the command. A
+    `/read` that resolved its own path made `AGENT2_DENY_CAPS=read` a statement
+    about the browser alone.
+
+    Two halves, and the second is the one that rots: the handler must *call* the
+    shared dispatcher, and no `_impl_*` may be called from `agent2cli.py` except
+    the three CLI-presentation locals — the FS four are the ones that were
+    re-exported, so an accidental reintroduction reads as a one-word edit.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(cli))
+
+    dispatched, local_impls = set(), []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id == "dispatch_tool" and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant):
+                dispatched.add(first.value)
+        elif isinstance(fn, ast.Name) and fn.id.startswith("_impl_"):
+            local_impls.append(f"line {node.lineno}: {fn.id}(…)")
+
+    assert "read_file" in dispatched, (
+        "agent2cli.py never dispatches read_file — the `/read` handler resolves "
+        "its own path again, with no workspace confinement, no capability gate "
+        "and no audit line")
+
+    allowed = {"_impl_search"}  # CLI-local: it prints into this terminal
+    strays = [x for x in local_impls if x.split(": ")[1].split("(")[0] not in allowed]
+    assert not strays, (
+        "agent2cli.py calls a CLI-local tool implementation directly; if it is "
+        "filesystem-sensitive that bypasses the sandbox: " + "; ".join(strays))
+
+
 def test_cli_local_tools_stay_local(monkeypatch):
     """web_search / save_memory / emit_plan are presentation-layer tools the CLI
     owns. Routing them to the package would change their behaviour.
@@ -784,3 +991,72 @@ def test_a_placeholder_key_is_never_handed_to_the_model(monkeypatch):
     monkeypatch.setattr(keys_mod, "genai", object())
     monkeypatch.setattr(keys_mod.KeyRotator, "_load_pin", lambda self: None)
     assert cli.KeyRotator().get() == (None, None, None)
+
+
+# ── The thinking budget asks the predicate, never a literal model list ─────────
+# ⚠️ REGRESSED ONCE, IN EXACTLY THIS SHAPE — see `config.supports_thinking()` and
+# the `MODEL_GROUPS` note in `cli/models.py`.
+#
+# `run_agent` gated `thinking_config` on a literal tuple of MODEL KEYS:
+#
+#     if mode_cfg.get("thinking") and model_key in ("2.5-pro", "3.1-flash",
+#                                                   "3.1-pro", "2.5-flash"):
+#
+# Three of those four keys are not in `config.MODELS` at all, and four keys that
+# ARE were missing. So `thinking` mode attached NO thinking budget on five of the
+# six selectable models in the CLI, while the web loop — which asks the predicate
+# — honoured the same selection. Nothing failed: the request went out, the answer
+# came back, and only the reasoning quietly disappeared. That is the failure mode
+# a literal copy of a table always has, and it is why the predicate takes a
+# *group*: a new model joins an existing group and inherits the answer for free.
+
+def test_model_groups_is_derived_from_the_model_table():
+    from agent2.cli.models import MODEL_GROUPS
+    assert MODEL_GROUPS == {k: v["group"] for k, v in config.MODELS.items()}, (
+        "cli.MODEL_GROUPS is a copy of the model table rather than a projection "
+        "of it — a copy is what rotted last time, in both directions")
+
+
+def test_every_selectable_model_gets_a_thinking_budget_today():
+    """`THINKING_GROUPS == ()` means no group is excluded — for all six keys."""
+    from agent2.cli.models import MODEL_GROUPS, MODELS, supports_thinking
+    for key in MODELS:
+        assert supports_thinking(MODEL_GROUPS.get(key, "")), (
+            f"{key} is selectable and silently gets no thinking budget in "
+            "`thinking` mode")
+
+
+def test_the_cli_thinking_gate_calls_supports_thinking_and_holds_no_model_list():
+    """⚠️ SOURCE-LEVEL: a wrong gate produces a correct-looking answer.
+
+    A behavioural test cannot see this — `run_agent` needs a live API key, and the
+    request succeeds either way. So assert on the decision itself: the gate must
+    ask `config.supports_thinking()` about the model's GROUP, and must not compare
+    `model_key` against a tuple of keys.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cli.run_agent)))
+
+    assert any(isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "ThinkingConfig"
+               for n in ast.walk(tree)), (
+        "the CLI no longer attaches a thinking budget at all")
+    assert "supports_thinking" in {n.id for n in ast.walk(tree)
+                                   if isinstance(n, ast.Name)}, (
+        "the CLI decides thinking support without config.supports_thinking() — "
+        "that is a second declaration of which groups qualify")
+
+    keys = set(config.MODELS)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for comp in node.comparators:
+            if isinstance(comp, (ast.Tuple, ast.List, ast.Set)):
+                literal = {e.value for e in comp.elts
+                           if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+                assert not (literal & keys), (
+                    f"run_agent compares against a literal list of model keys "
+                    f"({sorted(literal & keys)}) — that is the tuple that rotted")

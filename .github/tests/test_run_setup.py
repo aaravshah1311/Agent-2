@@ -22,6 +22,16 @@ and two classes of silent failure had already accumulated:
 2. **A launcher written where nothing looks** — see
    `test_the_launcher_lives_in_one_place_on_every_os`.
 
+⚠️ It also owns the ONE fact `run.py` shares with `agent2/database.py`: the name
+the legacy `.env` is retired to. `PRESERVE` lives here and decides what survives
+`--update`, and there are **two** writers of that name — `run._migrate_env_once()`
+and `database.migrate_env_keys()`, the latter running on every startup including
+the direct-entry, Docker and `install.py` paths that never execute `run.py` at
+all. Both are pinned here rather than one of them in a database test, because the
+invariant is their *agreement* and `PRESERVE` is the third party to it; splitting
+them would need a second copy of `_load_run_py()`, which is the drift this file
+exists to catch.
+
 These are drift guards, not behaviour tests: they load `run.py` as a module
 WITHOUT calling `main()`, so importing it must stay free of side effects.
 """
@@ -32,6 +42,8 @@ import pathlib
 import sys
 
 import pytest
+
+from agent2 import config as a2config
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -246,3 +258,187 @@ def test_the_windows_wrapper_is_a_batch_file():
     once and then never updated again.
     """
     assert run._wrapper_names() == ["agent2.bat", "agent2.cmd"]
+
+
+# ── Uninstall ──────────────────────────────────────────────────────────────────
+
+def _uninstall_targets() -> list[pathlib.Path]:
+    """The paths `uninstall()` would delete, without running it.
+
+    `uninstall()` prompts and then removes trees, so it cannot be called; the
+    list it builds is read out of its AST and evaluated against run.py's own
+    module-level paths. `eval` here reads this repository's own source, in a
+    namespace holding four `Path` objects and no builtins.
+    """
+    tree = ast.parse((ROOT / "run.py").read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "uninstall"), None)
+    assert fn is not None, "run.py no longer defines uninstall()"
+    ns = {"__builtins__": {}, "ROOT": run.ROOT, "VENV": run.VENV,
+          "ENV_FILE": run.ENV_FILE, "DB_FILE": run.DB_FILE}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "to_delete" for t in node.targets):
+            out: list[pathlib.Path] = []
+            for elt in node.value.elts:                       # type: ignore[attr-defined]
+                starred = isinstance(elt, ast.Starred)
+                expr = elt.value if starred else elt
+                # `ns` is the GLOBALS, not the locals: a generator expression runs
+                # in its own function scope and sees globals only, so a starred
+                # `*(... for s in ...)` raises NameError when these are passed as
+                # locals — which is how the starred form silently went unchecked.
+                val = eval(ast.unparse(expr), ns)
+                out.extend(val) if starred else out.append(val)
+            return out
+    raise AssertionError("uninstall() no longer builds a `to_delete` list")
+
+
+def test_uninstall_names_only_files_an_install_can_actually_create():
+    """Every path uninstall wipes must be one this installer can produce.
+
+    ⚠️ THE BUG THIS EXISTS FOR PRODUCED NO ERROR, AND THE TWO HALVES OF IT
+    CANCELLED. `to_delete` read `ENV_FILE.with_suffix(".env.migrated")`, which
+    looks like the obvious way to name the sibling file and yields
+    `.env.env.migrated`: `.env` is all suffix and has no stem for `with_suffix` to
+    replace. `_migrate_env_once()` had been written the same way — so uninstall was
+    deleting the right file by accident, and correcting this list ALONE made it
+    worse, naming a file the writer never created while leaving the one it did.
+    Both names are wiped now, and the writer is pinned separately by
+    `test_the_retired_env_file_is_named_the_thing_preserve_protects`.
+
+    `PRESERVE` is the independent declaration this is checked against: it is
+    what an update must keep, so it is also the complete list of state an
+    install creates. Comparing the two lists in both directions is what makes
+    this neither a tautology nor a restatement of the wipe list.
+    """
+    targets = _uninstall_targets()
+    names = {p.name for p in targets}
+    creatable = set(run.PRESERVE) | {run.VENV.name}
+
+    unreal = sorted(names - creatable)
+    assert not unreal, (
+        "uninstall() names files no install can create, so they are never "
+        f"deleted and the real ones survive: {unreal}")
+
+    missed = sorted(set(run.PRESERVE) - names)
+    assert not missed, (
+        "PRESERVE names state an install creates that uninstall leaves behind: "
+        f"{missed}")
+
+
+def _rename_arg(source: pathlib.Path, fn_name: str, ns: dict) -> pathlib.Path:
+    """The path `fn_name` in `source` renames the legacy .env to, without running it.
+
+    Read out of the AST and EVALUATED against the module's own path constant,
+    exactly as `_uninstall_targets()` is: both writers reach the rename only when a
+    real `.env` is on disk, both swallow every exception, and the whole point of the
+    bug is that the expression *looks* right — so evaluating it is the only way to
+    see which name it actually produces.
+
+    One walk for both writers on purpose. Two copies of this search would be the
+    same duplication the file is guarding against, and the second copy is always
+    the one that stops matching.
+    """
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+    assert fn is not None, f"{source.name} no longer defines {fn_name}()"
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "rename" and node.args):
+            return eval(ast.unparse(node.args[0]), {"__builtins__": {}, **ns})
+    raise AssertionError(f"{fn_name}() no longer retires the legacy .env")
+
+
+def _migrate_rename_target() -> pathlib.Path:
+    """Where `run._migrate_env_once()` retires the legacy .env."""
+    return _rename_arg(ROOT / "run.py", "_migrate_env_once",
+                       {"ROOT": run.ROOT, "ENV_FILE": run.ENV_FILE})
+
+
+def _database_rename_target() -> pathlib.Path:
+    """Where `database.migrate_env_keys()` retires the legacy .env.
+
+    `ENV` is a *local* import inside that function (`from agent2.config import ENV`,
+    to avoid a cycle), so the namespace supplies it the same way the function would.
+    """
+    return _rename_arg(ROOT / "agent2" / "database.py", "migrate_env_keys",
+                       {"ENV": a2config.ENV})
+
+
+def test_the_retired_env_file_is_named_the_thing_preserve_protects():
+    """⚠️ The WRITER's half of the dotfile trap, and the half that decides what is
+    actually on disk.
+
+    `_migrate_env_once()` imports a legacy `GEMINI_API_KEY` into agent2.db and then
+    renames `.env` aside — and it renamed through
+    `ENV_FILE.with_suffix(".env.migrated")`, which APPENDS on a dotfile and yields
+    `.env.env.migrated`. Nothing raised. But `PRESERVE` names `.env.migrated`, and
+    `self_update()`'s prune step deletes every top-level item `PRESERVE` does not
+    name, so the retired file — still holding the key the user typed in — was
+    removed by the next `python run.py --update` and reported only as a count of
+    "stale item(s)". The state latches too: after the rename `.env` is gone, so the
+    function returns at its existence guard forever and never gets a second chance.
+
+    Asserted on the EVALUATED expression, not on the source text, so `with_suffix`
+    cannot satisfy it; and asserted against `PRESERVE` as well as against the
+    literal, so renaming the retired file later cannot silently escape protection.
+    """
+    target = _migrate_rename_target()
+
+    assert target.name == ".env.migrated", (
+        f"the legacy .env is retired as {target.name!r} — `with_suffix` appends on a "
+        "dotfile, use `with_name`")
+    assert target.parent == run.ROOT, (
+        f"the retired .env lands outside the install at {target.parent}")
+    assert target.name in run.PRESERVE, (
+        f"{target.name!r} is not in PRESERVE, so self_update()'s prune step deletes "
+        "the user's retired credential file")
+
+    # Derived from pathlib's real behaviour rather than restated, so it doubles as a
+    # canary: if a future Python ever made `with_suffix` REPLACE on a dotfile, the
+    # first assertion here fails and this comment is what explains why.
+    legacy = run.ENV_FILE.with_suffix(".env.migrated").name
+    assert legacy != target.name, (
+        "with_suffix no longer appends on a dotfile — re-read this test and "
+        "run.py's two comments about it")
+    assert legacy in run.PRESERVE, (
+        f"an install that ran the old launcher holds its legacy key as {legacy!r}; "
+        "dropping it from PRESERVE deletes that file on the next update")
+
+
+def test_database_retires_the_env_to_the_same_name_run_py_does():
+    """⚠️ THE SECOND WRITER, AND THE ONE THAT ACTUALLY RUNS ON MOST STARTUPS.
+
+    `run.py` fixing its own copy of the dotfile bug is half a fix.
+    `database.migrate_env_keys()` is called from `init_db()`, so it runs on **every**
+    startup of every surface — including `.venv/bin/python agent2cli.py`, the Docker
+    entrypoint and `install.py`, none of which execute `run.py` at all. On those
+    paths it is the *only* migrator, and it carried the same
+    `ENV.with_suffix(".env.migrated")` — which appends on a dotfile and produces
+    `.env.env.migrated`.
+
+    The consequence is not a cosmetic name. `self_update()`'s prune step deletes
+    every top-level item `PRESERVE` does not name, so the retired file — still
+    holding the key the user typed in — was removed by the next
+    `python run.py --update` and reported as a count of "stale item(s)". And the
+    state latches: the rename succeeds, `.env` is gone, so the function returns at
+    its existence guard forever and the key is never recovered.
+
+    Asserted against run.py's own writer rather than against a second literal, so
+    the two can never disagree again: whichever one is edited, this fails. The
+    literal is still asserted once, in the run.py test above.
+    """
+    from_run = _migrate_rename_target()
+    from_db = _database_rename_target()
+
+    assert from_db.name == from_run.name, (
+        f"database.py retires the legacy .env as {from_db.name!r} while run.py uses "
+        f"{from_run.name!r} — one of the two is `with_suffix` on a dotfile, and "
+        "database.py is the writer that runs when run.py does not")
+    assert from_db.name in run.PRESERVE, (
+        f"{from_db.name!r} is not in PRESERVE, so `--update` deletes the credentials "
+        "database.py just retired")
+    assert from_db.parent.resolve() == run.ROOT, (
+        f"database.py retires the legacy .env outside the install, to {from_db.parent}")
+

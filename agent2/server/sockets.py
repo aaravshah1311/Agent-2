@@ -302,14 +302,20 @@ def register_sockets(socketio) -> None:
         if not (msg_id and new_text and chat_id):
             return
 
-        row = qone("SELECT created_at FROM messages WHERE id=?", (msg_id,))
+        row = qone("SELECT created_at, rowid AS rid FROM messages WHERE id=?", (msg_id,))
         if not row:
             return
 
-        # Delete the edited message and everything that came after it
+        # Delete the edited message and everything that came after it.
+        # ⚠️ THE rowid HALF OF THIS PREDICATE IS WHAT STOPS IT DELETING THE PAST.
+        # `created_at` is second-granular and `cli/store.save_history()` stamps a
+        # whole rewritten window with ONE timestamp, so `created_at >= ?` matched
+        # every row of a resumed conversation — editing the newest message wiped
+        # the entire chat. The order it deletes in is `core.context.MSG_ORDER`,
+        # spelled as a row-value comparison so the two halves cannot disagree.
         exe(
-            "DELETE FROM messages WHERE chat_id=? AND created_at >= ?",
-            (chat_id, row["created_at"]),
+            "DELETE FROM messages WHERE chat_id=? AND (created_at, rowid) >= (?, ?)",
+            (chat_id, row["created_at"], row["rid"]),
         )
 
         # Tell the UI to reload messages for this chat

@@ -623,9 +623,23 @@ def attempts(limit: int = 50, *, chat_id: str = "") -> list[dict]:
 
 
 def stats() -> dict:
-    """Aggregate model-call health. Counters only — no prompts, no keys."""
+    """Aggregate model-call health. Counters only — no prompts, no keys.
+
+    ⚠️ THIS IS THE ONE ACCOUNT OF LLM LATENCY AND LLM ERRORS (Task 27).
+    `core/metrics.py` declares both signals and deliberately does *not* measure
+    them: it forwards this dict as its `borrowed.llm` section. A second in-process
+    timer around the same call would produce a number covering a different window
+    (this process, since it started) from the one reported here (every process, up
+    to `ROUTER_LEDGER_MAX` rows) — two right-looking answers to one question, with
+    nothing in either payload to say which is which.
+
+    ⚠️ AGGREGATES ONLY, NEVER A ROW FETCH. `/api/health` and `/api/metrics` both
+    call this, so it must stay a handful of `GROUP BY`s; pulling the ledger into
+    Python to compute a percentile would make the health endpoint's cost grow with
+    `ROUTER_LEDGER_MAX`. Percentiles are what the in-process series are for.
+    """
     out = {"total": 0, "ok": 0, "failed": 0, "fallbacks": 0,
-           "avg_latency_ms": 0, "by_model": {}}
+           "avg_latency_ms": 0, "by_model": {}, "by_kind": {}}
     try:
         from agent2.database import qall
         row = qall("SELECT COUNT(*) AS n, SUM(ok) AS good,"
@@ -638,10 +652,21 @@ def stats() -> dict:
             out["failed"] = out["total"] - out["ok"]
             out["fallbacks"] = int(r.get("fb") or 0)
             out["avg_latency_ms"] = int(r.get("lat") or 0)
-        for r in qall("SELECT model, COUNT(*) AS n, SUM(ok) AS good"
+        for r in qall("SELECT model, COUNT(*) AS n, SUM(ok) AS good,"
+                      " AVG(latency_ms) AS lat, MAX(latency_ms) AS worst"
                       " FROM model_attempts GROUP BY model"):
             out["by_model"][str(r["model"])] = {
-                "calls": int(r.get("n") or 0), "ok": int(r.get("good") or 0)}
+                "calls": int(r.get("n") or 0), "ok": int(r.get("good") or 0),
+                "avg_latency_ms": int(r.get("lat") or 0),
+                "max_latency_ms": int(r.get("worst") or 0)}
+        # Failures grouped by classification. ⚠️ `''` is reported as
+        # "unclassified" rather than dropped: it is the kind `FALLBACK_KINDS`
+        # excludes, so an install whose failures are *all* unclassified is exactly
+        # the one where fallback never helps — and an omitted bucket reads as "no
+        # such failures" instead of "we could not name them".
+        for r in qall("SELECT failure_kind AS k, COUNT(*) AS n FROM model_attempts"
+                      " WHERE ok=0 GROUP BY failure_kind"):
+            out["by_kind"][str(r["k"] or "") or "unclassified"] = int(r.get("n") or 0)
     except Exception:
         pass
     out["breaker"] = breaker_state()

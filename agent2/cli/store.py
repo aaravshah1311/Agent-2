@@ -153,39 +153,99 @@ def prompt_dir_name() -> str:
 
 
 def last_chat_for_cwd() -> dict | None:
-    """The most recent conversation belonging to THIS project (cwd), or None.
+    """The conversation this project would continue, or None.
 
-    Read-only: it never creates a row. Used to decide whether to advertise
-    /load at startup, and by /load itself.
+    A read-only probe: it never creates a row, and it is the SAME selection the
+    loader uses, because it decides what the startup line *promises*. Advertising
+    one conversation and then opening another is a lie the user can only catch by
+    reading the transcript — so the rule lives once, in
+    `core.context.last_session()`, and this is the CLI's adapter onto it.
     """
     if not _CTX_OK:
         return None
+    return _core_ctx.last_session()
+
+
+# ⚠️ ONE window, read by the loader AND the writer, and that is the whole point.
+# It used to be two numbers: every loader took `[-60:]` while `save_history()`
+# wrote `h[-100:]`, so loading a 100-message conversation and saying one word
+# rewrote it as 61 — `save_history` DELETEs the chat's rows before re-INSERTing
+# the window it was handed, so the 40 turns the loader never asked for were gone
+# from the database, silently, with no error and nothing on screen.
+#
+# Harmless while loading was an opt-in `/load`. Continuity makes it happen on
+# EVERY launch, which is how a "resume where you stopped" feature would have
+# quietly become a "and forget the rest" feature. Load window == save window is
+# pinned in both directions by test_continuity.py.
+HISTORY_WINDOW = 200
+
+
+def _history_for(chat: dict) -> list:
+    """The stored message window of one chat, in the CLI's in-memory shape.
+
+    ⚠️ The order comes from `core.context.MSG_ORDER`, never a local clause: a
+    bare `ORDER BY created_at` returned this conversation **reversed**, because
+    `save_history()` stamps the whole rewritten window with one second and the
+    index it is served from is `DESC`. Reached only through
+    `load_last_conversation()`, i.e. only after `_CTX_OK`.
+    """
     try:
-        rows = _core_ctx.list_chats_for_cwd(limit=1)
-        return rows[0] if rows else None
+        rows = _db_qall(
+            "SELECT role, content, created_at FROM messages "
+            f"WHERE chat_id=? {_core_ctx.MSG_ORDER}", (chat["id"],))
     except Exception:
-        return None
+        return []
+    return _msgs_to_history(rows)[-HISTORY_WINDOW:]
 
 
 def load_last_conversation() -> list | None:
-    """`/load` — pull the last conversation for this project into the session.
+    """Pull the conversation this project stopped in back into the session.
 
-    Deliberately NOT called at startup: opening the CLI gives you a clean slate,
-    and you opt back into the previous conversation only by asking for it. Binds
-    S.chat to that chat so subsequent turns append to it instead of forking a
-    new one. Returns None when there is nothing to load.
+    THE explicit path: `/load`, and `--continue` at launch. It never consults
+    `core.context.auto_resume()` — an explicit ask is not governed by a default,
+    which is why this function and `resume_last_conversation()` are two functions
+    over one selection rule rather than one function with a flag. Binds `S.chat`
+    so later turns append to that conversation instead of forking a new one.
+
+    ⚠️ IT BINDS ONLY AFTER A NON-EMPTY READ. `S.chat` was being set before the
+    read was inspected, so an empty or unreadable conversation left the session
+    *bound to it* with no history — and the next `save_history()` DELETEs that
+    chat's rows before writing the window it was given, i.e. an empty one. A
+    failed load therefore erased the very conversation it failed to load. The
+    honest answer to "nothing came back" is None, and a clean session.
     """
     chat = last_chat_for_cwd()
     if not chat:
         return None
-    try:
-        rows = _db_qall(
-            "SELECT role, content, created_at FROM messages "
-            "WHERE chat_id=? ORDER BY created_at", (chat["id"],))
-    except Exception:
+    history = _history_for(chat)
+    if not history:
         return None
     S.chat = dict(chat)
-    return _msgs_to_history(rows)[-60:]
+    return history
+
+
+def resume_last_conversation() -> list | None:
+    """Continuity at launch — the history to carry on with, or None to start clean.
+
+    ⚠️ THE POLICY QUESTION IS ASKED HERE AND NOWHERE ELSE. `/load` and
+    `--continue` are a human asking out loud and work whatever `AGENT2_RESUME`
+    says; this is Agent2 deciding on their behalf, so it is the one path the
+    policy governs — and since the default is `off`, the one path that normally
+    returns None. Selection still comes from `core.context.last_session()`, so
+    the policy can never change *which* conversation `/load` opens, only whether
+    a launch opens one unasked.
+
+    On success `S.chat` is bound and the caller may read its title for the line
+    it prints; on None nothing was touched and the session is clean.
+    """
+    if not _CTX_OK:
+        return None
+    try:
+        if not _core_ctx.auto_resume():
+            return None
+    except Exception:
+        return None
+    return load_last_conversation()
 
 
 def bind_chat(chat_id: str) -> dict | None:
@@ -231,6 +291,11 @@ def save_history(h: list, model: str = "", mode: str = ""):
     conversation permanently truncated to whatever had landed. Now the rewrite
     applies whole or not at all, and the previous window survives a failure.
     Same call as `pil.optimize._merge_phrases`.
+
+    ⚠️ It writes `HISTORY_WINDOW`, the SAME number the loader reads. A larger
+    write window is not generosity: this DELETEs first, so whatever the loader
+    declined to read is what this deletes, and the two numbers disagreeing is a
+    silent truncation on every resume.
     """
     if not _CTX_OK:
         return
@@ -247,7 +312,7 @@ def save_history(h: list, model: str = "", mode: str = ""):
         import agent2.database as _adb
         cid = S.chat["id"]
         rows = [(str(_uuid.uuid4()), cid, m["role"], m.get("content", ""))
-                for m in h[-100:] if m.get("role") in ("user", "assistant")]
+                for m in h[-HISTORY_WINDOW:] if m.get("role") in ("user", "assistant")]
         # Auto-title from first user message. Computed BEFORE the batch so the
         # title write joins the same transaction as the messages it describes.
         title = None

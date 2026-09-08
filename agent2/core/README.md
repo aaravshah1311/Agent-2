@@ -3,9 +3,11 @@
 `agent2/core/` is the single source of truth for everything that would otherwise
 be duplicated between the Web UI (`agent2web.py`) and the CLI (`agent2cli.py`):
 the workspace sandbox, per-chat execution isolation, context assembly, command
-execution, cancellation, authorization, secrets, structured logging, and the
-shared memory/rules/context backends. Both interfaces import these modules — no
-interface re-implements this logic locally.
+execution, cancellation, authorization, secrets, structured logging, the shared
+memory/rules/context backends — and the whole autonomy family: the one generalized
+DAG, its scheduler, workflows, the goal-sentence planner, the UltraCode loop and the
+verifier they all share. Both interfaces import these modules — no interface
+re-implements this logic locally.
 
 > **Why "core" and not "shared".** These are not utilities. Each module here owns
 > a **decision** that must have exactly one answer, because a second answer drifts
@@ -25,12 +27,37 @@ agent2/core/
 │   ├── sources.py     priority · TTL · the four measures
 │   ├── budget.py      what fits inside the model's token window
 │   └── isolation.py   may this project see that row
+├── skills/        which instruction files reach THIS prompt, and why the rest did not
+│   ├── discovery.py   one bounded walk of .agent2/skills/, TTL-cached
+│   ├── normalize.py   what a foreign vendor's header MEANS here (the only namer)
+│   ├── select.py      five tiers; index IS rank
+│   └── state.py       on/off/automatic — a row, never a file edit
+├── dag/           THE one generalized graph engine — every consumer's, no feature name
+│   ├── model.py       what a Graph, a Node and an Edge ARE
+│   ├── validate.py    whether one can ever finish (a cycle produces no error)
+│   ├── store.py       nine node states, two derived on every read
+│   └── schedule.py    which READY nodes actually run NOW, and what held the rest
+├── workflow/      the first DAG consumer — a plan, not a second engine
+│   ├── graph.py       WorkflowDef IS dag.Graph (aliased, so nothing can drift)
+│   ├── loader.py      .agent2/workflows/*.yaml — a declared stdlib parser subset
+│   ├── runner.py      rows in, progress re-derived out
+│   └── dynamic.py     a goal sentence becomes a graph (plan is the default)
+├── ultracode/     the autonomous loop — the fourth consumer, two doors only
+│   ├── stages.py      the eleven stage words, DERIVED from the rows
+│   ├── plan.py        evidence in, graph out (names and counts, never prose)
+│   └── engine.py      who drives a run, and every way it may refuse
+├── verify.py      "Done" is not verification — five verdicts, from the ledgers
+├── health.py      one assembly answers "is it working" — 14 sections
+├── metrics.py     thirteen declared signals; three deliberately BORROWED
+├── projectscan.py what this project IS, and what its own comments say about it
+├── projectdoc.py  .agent2/agent2.md — and which half of it a human owns
 ├── pil/           the offline Personal Intelligence Layer
 ├── commands.py    execution STATE — the lifecycle and the watchdog verdict
 ├── procio.py      pipe I/O and the process-tree kill; records nothing
-├── scheduler.py   bounded worker pool for agent turns
-├── tasks.py       persistent tasks + checkpoints
-├── recovery.py    picking interrupted work back up
+├── scheduler.py   bounded worker pool for agent TURNS (never for graph nodes)
+├── tasks.py       persistent tasks + checkpoints — and every DAG node is one
+├── recovery/      picking interrupted work back up; what a killed process left
+├── execstate.py   whether a run is still alive (pid + heartbeat, one owner)
 ├── sync.py        THE synchronization layer (locks, bus, caches, poller)
 ├── diffs.py       diff computation + preview_window()
 ├── highlight.py   the one tokenizer (ships spans, never a second lexer)
@@ -218,11 +245,200 @@ runner owns the handle. Both kill ceilings default **off** and only the stuck
   response, all three handled. ⚠️ Turning the pool off can never be why a message
   goes unanswered: with it disabled, a turn runs on its own thread.
 - **tasks** — persistent tasks and checkpoints, surfaced at `GET /api/tasks`.
+  ⚠️ **Every DAG node is one of these rows**, which is why a workflow node gets the
+  checkpoints, the heartbeat, `/recovery` and the crash scan for free.
 - **recovery** — picks interrupted work back up and ⚠️ **never re-runs completed
-  work**; it prepends a briefing rather than replaying tool calls.
+  work**; it prepends a briefing rather than replaying tool calls. `classify` answers
+  two different questions — `safe_to_repeat()` for a repeat, `safe_to_continue()` for
+  a scheduler — and ⚠️ asking the wrong one is how a bounded retry becomes
+  structurally unable to fire even once.
 
 ⚠️ `stop_agent` and disconnect call **both** `scheduler.cancel()` and
 `sessions.cancel()` — different halves of one guarantee.
+
+⚠️ **`scheduler.py` bounds TURNS and must never bound graph nodes.** That queue
+outlives any single run; `dag/schedule.py` bounds the nodes of one run and dies with
+it. Two pools, because one would make a full turn backlog stall a graph that was
+already mid-flight.
+
+---
+
+## dag — ONE generalized graph engine
+
+The architectural rule the whole autonomy family rests on: **one DAG, one scheduler,
+one task system, one recovery system, one verifier.** Workflow, Dynamic Workflow and
+UltraCode are **consumers, never engines**.
+
+⚠️ **Feature-agnosticism is a test here, not a promise.** Structural `ast` tests
+assert that no `if workflow:` / `if ultracode:` and **no feature name at all** appears
+in this package. The domain half is **injected** — `validate(…, knob=…, label=…)` — so
+a 4-node workflow is refused with the workflow feature's own sentence, word for word,
+by an engine that has never heard of workflows.
+
+⚠️ **Nine states, two of them derived.** Six read straight off `agent_tasks.status`;
+**READY and BLOCKED are computed on every read**. Storing readiness would let a crash
+leave a node claiming READY behind an upstream that never finished — and deriving is
+also cheaper: one `qone` + one `qall` for a graph of any size.
+
+⚠️ **No new table and no migration.** A graph is one `exec_workflows` row plus N
+`agent_tasks` rows, node id on `CP_NODE` and run id on `CP_WORKFLOW`.
+
+⚠️ **A cycle is the one error that produces no error** — `tasks.ready()` releases a
+node when its dependencies are *settled*, so a ring of three simply never becomes
+ready: `ready()` returns `[]` forever, nothing raises and nothing is logged.
+`find_cycles()` is iterative, because a 500-node chain must be **reported**, never
+recursed into a `RecursionError`.
+
+⚠️ **`schedule.py` never blindly runs every READY node, and every node it declines
+carries a reason** (`HOLD_CODES`, with `taken | held == offered` asserted). It derives
+no readiness of its own — `tasks.ready()` is still the only predicate — and the
+corollary is the surprise: `ready()` releases a node whose upstream **failed**, so
+declining it and marking it SKIPPED is the scheduler's job or the run holds itself open
+forever. In-flight is **derived from the rows**, never counted in memory, because dual
+mode is two processes over one `agent2.db` and a counter silently doubles the ceiling.
+
+---
+
+## workflow — the first consumer
+
+`graph.py` says what a workflow is (⚠️ `WorkflowDef` **is** `dag.Graph`, aliased — so
+there is no adapter to keep in sync), `loader.py` reads one off disk, `runner.py` turns
+one into rows and reads it back, `dynamic.py` turns a **goal sentence** into one.
+
+⚠️ **Progress is derived from the rows, never read out of the run.**
+`exec_workflows.state` is a breadcrumb that `execstate.workflow_step()` *replaces* on
+every node transition, so trusting it makes a killed run report the progress it had at
+the moment it died.
+
+⚠️ **A turn gets the current node, not the plan.** `for_turn()` inlines exactly one
+instruction and *names* the rest — a worker gets only what it needs — and it is **flat,
+not merely cheap**: a 24-node graph costs the same reads as a 3-node one.
+
+⚠️ **PyYAML is not a dependency, so `loader.SUBSET` declares what this parser reads and
+nothing outside it is guessed at.** An older schema still runs (`UPGRADES` is a ladder,
+and each step must *advance* the version or the walk would hang). ⚠️ The **filename is
+the name**; a disagreeing `name:` line is reported and loses. ⚠️ A **truncated
+declaration is refused** — the tail of a YAML file is where the last node's `needs:`
+lives.
+
+⚠️ **In `dynamic.py`, `plan` is the default and writes nothing at all** — no
+`exec_workflows` row, no `agent_tasks` row. `auto` must be asked for by name, and an
+*unrecognised* mode word is refused rather than coerced. Its only structural opinion is
+`_acyclic()`: every `needs` must point **backwards in declaration order**, which is what
+licenses a too-long plan to be clipped instead of refused.
+
+---
+
+## ultracode — the autonomous loop
+
+UNDERSTAND → INSPECT → DISCOVER SKILLS → PLAN → EXECUTE → OBSERVE → ANALYZE → VERIFY →
+(pass ⇒ continue | fail ⇒ RE-PLAN → EXECUTE). The **fourth** DAG consumer, and no new
+table.
+
+⚠️ **The one new fact is the stage, and it is derived from the rows and never stored** —
+`execstate.workflow_step()` replaces `exec_workflows.state` on every node transition, so
+a stage written there would be gone by the next node. Deriving is also why a run killed
+mid-flight reports the stage that is true **now**, with no stale copy to reconcile.
+
+⚠️ **Verification is a node**, because a check outside the graph could not hold work
+back. ⚠️ **Approval is a node too** — created and immediately PAUSED with the roots
+depending on it, and `tasks.pause()` writes **no** stop checkpoint, which is the only
+thing separating *a human chose to hold this* from *a crash abandoned it*.
+
+⚠️ **One clock, checked between cycles.** The budget is never handed to
+`schedule.run()`: the pump owns the node timeout, and two clocks over one node is two
+answers — so an overrun is *reported* at a boundary rather than killing a worker
+mid-write.
+
+⚠️ **Entry is `/ultracode` and `POST /api/ultracode` only, asserted structurally.** This
+loop writes code, so *explicit, never automatic* is enforced by the importer list rather
+than promised.
+
+---
+
+## verify — "Done" is not verification
+
+One question for anything that runs: *something said it finished — does the durable
+record agree?* ⚠️ It exists because `agent_tasks.status` is **written by the thing being
+judged**, so a node marked COMPLETED whose only write failed is indistinguishable from
+one that genuinely worked.
+
+⚠️ **It verifies a task row, which is why it knows nothing about workflows** — it
+imports neither `core.dag` nor `core.workflow`, and that is exactly what stops the
+forbidden `if workflow:` from ever being needed.
+
+Five verdicts, and the middle three are the point: `open` · `unsuccessful` ·
+`confirmed` · `contradicted` · `unconfirmed`. ⚠️ `verified` and `ok` are **two
+questions and stay two** — a run of pure reasoning nodes is legitimately unverifiable
+and must still be allowed to finish. ⚠️ **Read-only, and it does not re-stat disk**: a
+file a later step legitimately replaced would read as a contradiction. ⚠️ **Two queries
+per report at any node count.** ⚠️ There is deliberately **no off switch** —
+verification off does not make Agent-2 quieter, it makes it *credulous*.
+
+---
+
+## health / metrics — the two read surfaces
+
+- **health** — one assembly answers *is it working*, read by `/health` **and**
+  `GET /api/health`. Fourteen sections, each a **projection** of the reader that already
+  owns the fact. ⚠️ `ok` and the `503` are decided by `problems` **alone** — every
+  supported configuration that trips the 503 spends the meaning of the 503. ⚠️ A row may
+  never say `fail` while the report says `ok`, so `_rows()` derives its states from the
+  lines the aggregate was built from rather than re-testing the data. ⚠️ **`off` is not a
+  lesser `warn`**: the checkpointer, the scheduler and both MCP bridges can be off on
+  purpose, and a cross printed at a deliberate choice is how an alert stops being read.
+- **metrics** — thirteen declared signals at the existing single-writer chokepoints, so
+  there is one stopwatch per fact. ⚠️ **Three are borrowed, not measured** — LLM latency
+  and errors belong to `llm.router`, denials to `permissions` — and recording into one is
+  a counted **no-op**, which is the guard that stops the second drifting copy appearing.
+  ⚠️ **Cardinality is capped per signal**, because labels are created on first
+  *observation* and admitting model-supplied text lets junk names fold the real tools
+  into `~other` for the life of the process — a measurement destroyed by what it
+  measures. ⚠️ No content, ever: a series holds numbers and one enum-ish label.
+
+---
+
+## skills — instruction files, selected per request
+
+`.agent2/skills/` — prose a human (or another agent's toolchain) left in the project.
+`discovery` walks, `normalize` translates, `select` ranks, `state` remembers.
+
+⚠️ **Not every skill in every prompt** — that is the acceptance bar and the reason
+`select.py` exists: ten discovered skills and an unrelated message put **nothing** in
+the prompt. Five tiers, declared as data where **index IS rank**: request → project doc
+→ enabled → auto-relevant → general. ⚠️ `priority` orders *within* a tier and may never
+promote past one.
+
+⚠️ **No write API reaches this package** — asserted structurally, because a skill is
+frequently somebody else's file in somebody else's repo. So enablement is a **row**, not
+a frontmatter edit. ⚠️ **Three states, and the third is the point**: never-chosen still
+allows automatic selection, and *off* beats every signal including the request naming it.
+
+⚠️ **The vendor is a label, never a dispatch** — no module outside `normalize.py` may
+name one, which is the difference between a normalization layer and a per-vendor plugin.
+
+---
+
+## projectscan / projectdoc — what this project IS
+
+`/init` walks the workspace and writes `.agent2/agent2.md`, which every later prompt
+reads back **as fact**.
+
+⚠️ **A partial answer may never read as a complete one** — three ceilings, and
+`truncated_by` says which engaged. A scan that quietly stopped at 20 000 files and wrote
+"no tests were found" into a *committed* file is the failure this is shaped around.
+⚠️ **A runner is proved, never guessed.**
+
+⚠️ **`_leading_comment()` is a syntax gate, not a heuristic** — comment syntax in,
+comment text out, `""` for an undeclared extension. These notes are the one part of the
+scan that reaches a model, so the boundary cannot be a promise.
+
+⚠️ **Ownership is the `<!-- agent2:generated -->` marker on a section's first body line
+— nothing else.** Delete it and the section is yours forever. ⚠️ An identical rewrite is
+**not a write**. ⚠️ And the doc is bigger than the prompt slot, so `for_prompt()` decides
+**which half** a turn gets: the clip it replaced was head-first, and a document ends with
+the sections a human took over — so the first thing the prompt discarded was the user's
+own standing orders.
 
 ---
 
@@ -264,14 +480,25 @@ pipeline.
 
 Colour is the whole contract: green added, red removed, grey context, and **yellow
 is the paired count** `~min(added, removed)` plus the `@@` markers. ⚠️ Never a
-fifth `"mod"` row tag: `diffview.revert_change` rebuilds the before-side as
-`[t for tag,t in ch.lines if tag in ("del","ctx")]` and **writes it to disk**, so a
-`mod` tag would silently delete every modified line from the user's file.
+fifth `"mod"` row tag: `hunks_of()` rebuilds each hunk's two sides from exactly
+these four names and **returns `None` — refuse — on any other**, and `revert_text()`
+is what `diffview.revert_change` writes to disk, so a `mod` tag would leave the
+viewer unable to undo a modified line at all (and `to_patch` with no sigil to emit
+for it).
 
 - `summarize()` is the one thing that says what a set of changes **totals** to. A
   local `sum()` in a renderer makes the CLI and the browser disagree about one turn.
 - `preview_window()` is the one window function. Re-deriving it in a renderer is
   how two surfaces show different slices of the same change.
+- `hunks_of()` / `revert_text()` are the one **undo** computation. ⚠️ An undo
+  reverse-applies the hunks to the file **on disk**; it never rebuilds the file out
+  of the diff rows. `ch.lines` is an `n=3` window, so `del`+`ctx` is the whole
+  pre-change file only when the file happened to fit inside its own hunks — that
+  rebuild shipped in `diffview.revert_change`, and on a 200-line file with one
+  changed line it wrote 7 lines and reported success. `ch.truncated` cannot catch it:
+  that flag means "past `MAX_DIFF_LINES` **rendered** rows", not "elided". Every hunk
+  is verified against the file in hand first and one mismatch refuses the whole undo,
+  so a file that moved on is never half-rewritten.
 - `DiffStore.mark()` → `since(mark)` is how "this turn" is identified. ⚠️ A saved
   `len(store.all())` breaks the moment the cap engages, because `add()` trims from
   the **front** — a length is then not an index, and the recap confidently reports
@@ -385,8 +612,9 @@ stderr for warnings and above. It never raises; a logging failure cannot break t
 agent.
 
 ⚠️ **The helper you call and the string the log holds are not spelled the same.**
-Fourteen named helpers emit fourteen **dotted** kinds, and two of them diverge by
-more than punctuation — grep for the right-hand column, never the function name:
+The named helpers emit **31** dotted kinds between them, and several diverge by more
+than punctuation — grep for the right-hand column, never the function name. A
+**selection**, chosen because these are the ones whose spelling surprises people:
 
 | Helper | Emitted kind |
 |---|---|
@@ -400,9 +628,19 @@ more than punctuation — grep for the right-hand column, never the function nam
 | `context_source_failed` | `context.source` |
 | `context_trimmed` | `context.trimmed` |
 
+The rest of the 31 are the recovery, verification, project and skills families —
+`recovery.scan`, `recovery.scan.done`, `recovery.interrupted`, `recovery.start`,
+`recovery.verified`, `recovery.resumed`, `recovery.retried`, `recovery.completed`,
+`recovery.failed`, `recovery.review`, `verify.reported`, `verify.contradicted`,
+`exec.interrupted`, `exec.persist`, `project.scan`, `project.doc`, `skills.applied`.
+
 A generic `event()` / `exception()` pair covers anything else; production code uses
-it with three further dotted names (`agent.model_fallback`, `agent.part_skipped`,
-`scheduler.error`), for **17** distinct kind strings in total.
+it with **four** further dotted names (`agent.model_fallback`,
+`agent.parallel_calls_deferred`, `agent.part_skipped`, `scheduler.error`), for
+**35** distinct kind strings in total. ⚠️ Count them by walking the helpers' own
+`event("…")` arguments plus a grep for direct `alog.event("…")` calls in production
+code — a bare grep over the whole tree also picks up a `'test'` string from the
+suite, which is how a 36 that looks derived gets quoted.
 
 ⚠️ Never point `server/weblog` at the `agent2` namespace. Replacing that logger's
 handlers silently kills the audit file.
@@ -444,10 +682,20 @@ handlers silently kills the audit file.
 | procio | `test_procio.py` |
 | scheduler | `test_scheduler.py` |
 | tasks · recovery | `test_tasks.py`, `test_recovery.py` |
+| execstate · crash recovery | `test_execstate.py`, `test_crashrecovery.py` |
 | sync | `test_sync.py` |
 | diffs | `test_diffs.py` |
 | permissions | `test_authz.py` |
 | secrets | `test_secrets.py` |
+| skills (discovery · normalize · select · state) | `test_skills.py` |
+| dag (model · validate · store · schedule) | `test_dag.py` |
+| workflow (graph · runner) · workflow files | `test_workflow.py`, `test_workflowfile.py` |
+| dynamic workflow | `test_dynamic.py` |
+| ultracode (stages · plan · engine) | `test_ultracode.py` |
+| verify | `test_verify.py` |
+| health | `test_health.py` |
+| metrics | `test_metrics.py` |
+| projectscan · projectdoc | `test_init.py` |
 | pil | `test_pil.py` |
 | logging | `test_logging.py` |
 
@@ -456,7 +704,7 @@ touches a real `agent2.db`.
 
 ```bash
 python -m pytest .github/tests/test_core.py -v
-python -m pytest .github/tests/            # the whole suite: 1602 tests
+python -m pytest .github/tests/            # the whole suite: 2670 tests
 ```
 
 Many of these are **sabotage-verified** — the test was proven to fail against a

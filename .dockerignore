@@ -7,11 +7,25 @@
 venv/
 env/
 
-# Nested self-clone created by install.py / run.py --update.
-# The old name is kept so a checkout that predates the Agent-2-Beta → Agent-2
-# rename does not start copying its stale nested clone into the build context.
+# Nested self-clone created by install.py / run.py --update
 Agent-2/
-Agent-2-Beta/
+
+# ⚠️ The host's state, which is what line 3 promises never to copy in. The image
+# builds its own DB on the /data volume (AGENT2_DB), so a host agent2.db in the
+# build context is baked into every layer of the image — API keys, memories and
+# the whole chat history — and stays there in any image that is pushed or shared.
+# Inert at runtime and invisible, which is exactly why it needs a rule.
+agent2.db
+agent2.db-wal
+agent2.db-shm
+agent2.db-journal
+*.sqlite
+*.sqlite3
+.env
+.env.migrated
+
+# Logs are written next to the DB and are per-machine
+logs/
 
 # Python caches
 __pycache__/

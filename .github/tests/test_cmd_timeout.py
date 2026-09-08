@@ -391,16 +391,34 @@ def test_an_idle_timeout_ends_a_command_that_is_alive_but_silent():
 
 def test_a_chatty_command_is_never_idle_timed_out():
     """The false-positive direction, which matters more than the true-positive
-    one: a command that keeps printing must survive a short idle ceiling."""
+    one: a command that keeps printing must survive a short idle ceiling.
+
+    ⚠️ **THE CEILING AND THE SCRIPT LENGTH MOVE TOGETHER, AND ONE WITHOUT THE OTHER
+    BREAKS THIS TEST IN OPPOSITE DIRECTIONS.** It read `idle_timeout=1.0` over a
+    1.8 s script and failed once in a full-suite run — rc 124, `no output for 1s`
+    — because the idle clock starts when the process starts and a cold `python -c`
+    on a loaded Windows box can take longer than a second to reach its first
+    `write`. That is startup latency, not the silence this feature is about, so the
+    ceiling now leaves room for it. But raising the ceiling ALONE would have quietly
+    dismantled the test: at 2 s over a 1.8 s script, a watchdog that ignored output
+    ticks entirely and killed on total elapsed would fire *after* the script had
+    already exited, and this assertion would pass against exactly the break it
+    exists to catch. Hence 30 iterations — 4.5 s of life against a 2 s ceiling.
+    That direction is **sabotage-verified rather than argued**: with
+    `commands.Command.idle` reduced to `now - started_mono` (the tick-blind form,
+    output ignored), this test fails `assert 124 == 0` carrying
+    `no output for 2s — terminating process tree`, and passes again the moment
+    `last_output_mono` is honoured.
+    """
     from agent2.cli import runtime as rt
 
     script = ("import time, sys\n"
-              "for i in range(12):\n"
+              "for i in range(30):\n"
               "    sys.stdout.write(str(i) + '\\n')\n"
               "    sys.stdout.flush()\n"
               "    time.sleep(0.15)\n")
     _out, _err, rc, _dur = rt.run_cmd_stream(
-        f'python -c "{script}"', session_id="t6-chatty", idle_timeout=1.0,
+        f'python -c "{script}"', session_id="t6-chatty", idle_timeout=2.0,
     )
     assert rc == 0
     assert C.list_all(session_id="t6-chatty")[0].status == C.CommandStatus.COMPLETED

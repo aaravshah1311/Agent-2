@@ -61,10 +61,14 @@ silent for many minutes, so what is on by default is the REPORT — after
 An unknown `command_id` returns None rather than raising. Bookkeeping may never
 be the reason a command fails to run, so callers are written as fire-and-forget.
 
-Scope note: the registry is in-memory. Durable execution state across a restart
-is Phase 8 (Task 24), and building it here would be implementing a later task
-early. What is in memory today is already enough for the reliability work in
-Tasks 5–7, which is all within one process lifetime.
+Scope note: **the registry is still the authority while this process lives.**
+`core/execstate.py` (Task 24) now mirrors every lifecycle edge into `agent2.db`
+so the *next* process can see what was in flight, but it is a shadow and never
+an argument: it holds no fact this module does not own, it refuses no write, and
+the last write wins on purpose — because "whichever verdict lands first wins"
+above is decided here, not there. The two chokepoints are `create()` and
+`_mutate()`, and the write happens **outside `_lock`** for the reason `_record`
+states.
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ from dataclasses import dataclass, field
 # CLI palette (`from .theme import PU`). Reading `_config.CMD_STUCK_AFTER` at call
 # time is what lets a test or a caller change the threshold and be believed.
 from agent2 import config as _config
+from agent2.core import metrics as _metrics
 
 # ── States ────────────────────────────────────────────────────────────────────
 
@@ -288,6 +293,32 @@ def _prune_locked() -> None:
         _registry.pop(cmd.id, None)
 
 
+def _record(cmd: CommandExecution | None) -> None:
+    """Mirror one snapshot into the durable ledger (Task 24).
+
+    ⚠️ **CALLED OUTSIDE `_lock`, ALWAYS.** `heartbeat()` fires once per output
+    LINE and this module's contract is that the cheap path allocates nothing and
+    touches no DB; a write under the lock would put SQLite on that path and make
+    every reader of the registry wait behind it. `core/execstate.py` owns the
+    throttle that keeps a `make -j8` from writing one row per line — and owns the
+    rule that a status *change* is never throttled.
+
+    ⚠️ The import is lazy and the swallow is scoped to this one call: `execstate`
+    imports THIS module at module scope, so a module-level import here would be a
+    cycle. The `noqa` is deliberately narrow — this module is not a
+    degrade-never-raise module, and a registry mutation that fails must still
+    raise. Only the durable breadcrumb is optional, exactly as
+    `core/context/__init__.py:87` argues for the paused-chat interrupt.
+    """
+    if cmd is None:
+        return
+    try:
+        from agent2.core import execstate as _exec
+        _exec.record_command(cmd)
+    except Exception:  # noqa: BLE001, S110 — see above: bookkeeping never breaks a command
+        pass
+
+
 def create(command: str, *, task_id: str = "", session_id: str = "",
            surface: str = "", term_id: str = "", timeout: float | None = None,
            idle_timeout: float | None = None,
@@ -315,7 +346,9 @@ def create(command: str, *, task_id: str = "", session_id: str = "",
     with _lock:
         _registry[cmd.id] = cmd
         _prune_locked()
-        return cmd.copy()
+        snap = cmd.copy()
+    _record(snap)          # ⚠️ outside the lock — see `_record`
+    return snap
 
 
 def get(command_id: str) -> CommandExecution | None:
@@ -330,6 +363,11 @@ def _mutate(command_id: str, fn) -> CommandExecution | None:
     ⚠️ THE ONE WRITER. Every transition goes through here so the terminal-state
     guard cannot be forgotten by one helper and honoured by the others — the same
     single-writer discipline `core/tasks._apply` uses, for the same reason.
+
+    ⚠️ The snapshot is captured under the lock and the durable ledger is written
+    *after* it is released (Task 24). A settled row returns early without a second
+    ledger write: the transition that settled it already persisted it, so
+    re-recording buys nothing and would only re-take the DB on a racing cancel.
     """
     with _lock:
         cmd = _registry.get(str(command_id or ""))
@@ -341,7 +379,9 @@ def _mutate(command_id: str, fn) -> CommandExecution | None:
             # transcript would claim work was abandoned that in fact finished.
             return cmd.copy()
         fn(cmd)
-        return cmd.copy()
+        snap = cmd.copy()
+    _record(snap)          # ⚠️ outside the lock — see `_record`
+    return snap
 
 
 def starting(command_id: str) -> CommandExecution | None:
@@ -369,7 +409,16 @@ def heartbeat(command_id: str, lines: int = 1) -> CommandExecution | None:
 
     ⚠️ Called by the runner for every output line. This is the cheap path — a
     dict lookup and two field writes under an uncontended lock — because it runs
-    at output rate. Nothing here allocates, logs, notifies or touches the DB.
+    at output rate. Nothing inside the lock allocates, logs, notifies or touches
+    the DB.
+
+    ⚠️ Since Task 24 the ledger write in `_mutate` runs *after* the lock is
+    released, and `execstate` throttles a status-unchanged write to
+    `config.EXEC_BEAT_SEC` — so a `make -j8` still costs one UPSERT every few
+    seconds rather than one per line, and no reader of the registry ever waits
+    behind SQLite. That throttle is the only thing standing between this function
+    and a per-line database write: do not move the call inside the lock, and do
+    not bypass `_record`.
     """
     def _fn(cmd: CommandExecution) -> None:
         cmd.last_output_mono = time.monotonic()
@@ -386,6 +435,23 @@ def heartbeat(command_id: str, lines: int = 1) -> CommandExecution | None:
 def _settle(command_id: str, status: str, *, exit_code: int | None = None,
             stdout: str = "", stderr: str = "",
             error: str = "") -> CommandExecution | None:
+    """Move a live execution to a terminal state. Every ending funnels here.
+
+    ⚠️ IT IS ALSO THE COMMAND-DURATION MEASUREMENT (Task 27), and the list is
+    how it stays honest: `_fn` runs *only* when `_mutate` actually applies the
+    transition, so a non-empty `elapsed` means "this call is the one that settled
+    it" — a cancel racing a normal exit hits the terminal-state guard, never runs
+    `_fn`, and records nothing. Reading `snap.status` afterwards instead would
+    measure the same command twice and label the second one with a status this
+    call did not cause.
+
+    The measure is spawn → settle, labelled by the terminal status, so
+    `command.duration` can be read per outcome; a command that never started
+    (`started_mono == 0`, a spawn that failed) has no duration to report and is
+    skipped rather than recorded as zero.
+    """
+    elapsed: list[float] = []
+
     def _fn(cmd: CommandExecution) -> None:
         cmd.status = status
         cmd.completed_at = _iso()
@@ -398,7 +464,12 @@ def _settle(command_id: str, status: str, *, exit_code: int | None = None,
             cmd.stderr = _text(stderr, MAX_SNAPSHOT)
         if error:
             cmd.error = _text(error, MAX_COMMAND)
-    return _mutate(command_id, _fn)
+        if cmd.started_mono:
+            elapsed.append((cmd.completed_mono - cmd.started_mono) * 1000.0)
+    snap = _mutate(command_id, _fn)
+    if elapsed:
+        _metrics.observe(_metrics.COMMAND_DURATION, elapsed[0], status)
+    return snap
 
 
 def complete(command_id: str, exit_code: int, stdout: str = "",

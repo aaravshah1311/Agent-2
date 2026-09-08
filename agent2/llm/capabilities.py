@@ -455,13 +455,22 @@ guess a context window you do not know - null is the correct answer there.
 """
 
 
-def _extract_json(text: str) -> dict:
+def extract_json(text: str) -> dict:
     """Pull the first JSON object out of a model reply.
 
     Models wrap JSON in fences and prose despite being told not to, and a
     classification that failed over a stray "Here you go:" would be a silent
     downgrade to unknown. Slicing between the outermost braces handles every form
     of that without needing a parser for the wrapper.
+
+    ⚠️ **PUBLIC BECAUSE IT IS THE SHARED HALF OF `ask_one_shot`.** Every off-turn
+    question in this build asks for JSON and therefore needs exactly this tolerance,
+    so it is exported next to the asker rather than re-derived by each caller — the
+    third copy is the one that would have drifted. `core/projectdoc.py` keeps a local
+    twin on purpose and says so: `/init` must produce a document with the whole `llm`
+    package unimportable, so it may not depend on this module at import time. A caller
+    that reaches the parse only *after* a successful lazy import of `ask_one_shot` has
+    no such problem and uses this one.
     """
     raw = str(text or "").strip()
     start, end = raw.find("{"), raw.rfind("}")
@@ -472,6 +481,11 @@ def _extract_json(text: str) -> dict:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+#: The spelling this module has used since Task 17. One function, two names — never
+#: two functions, which is what the one-declaration rule is about.
+_extract_json = extract_json
 
 
 def _ask_gemini(prompt: str) -> str:
@@ -518,6 +532,28 @@ def _ask_any_provider(prompt: str) -> str:
     except Exception:
         return ""
     return ""
+
+
+def ask_one_shot(prompt: str) -> str:
+    """THE off-turn model question: ask the cheapest thing available, once.
+
+    ⚠️ ONE DECLARATION OF "how do I ask a model something outside a turn".
+    `_ask_gemini` → `_ask_any_provider` is the ladder this module already used for
+    classification, and `core/projectdoc.py` needs the same thing to write a
+    project's Overview, so it is exposed here rather than reimplemented there. A
+    second copy would mean a second key rotation, a second provider fallback and a
+    second definition of "cheapest" — and only one of them would get fixed.
+
+    ⚠️ It returns `""` for every failure, and callers must treat that as *the
+    model was not available*, never as an empty answer. Nothing here raises: both
+    callers are describing something, not doing it, and an install with no key
+    must still be able to run `/init`.
+
+    ⚠️ NEVER ON A HOT PATH. This is a billable network round trip. It belongs in a
+    background thread or behind an explicit user command, exactly as
+    `rank_with_model` and `/init` use it.
+    """
+    return _ask_gemini(prompt) or _ask_any_provider(prompt)
 
 
 def _provider_format(model_key: str) -> str:

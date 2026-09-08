@@ -46,6 +46,9 @@ CONTEXT ASSEMBLY — the invariants, all of them regression-pinned
 same second, so ordering by timestamp alone left the whole turn tied. SQLite
 breaks ties by rowid, and under DESC that is *reversed* — the model was handed
 each turn backwards, with `tool_result` ahead of its own `tool_call`.
+It is spelled once, as `core.context.MSG_ORDER_DESC`, because four other readers
+of this table each carried their own clause and each was still missing the
+tie-break; `core/context/__init__.py` records what that cost.
 
 ⚠️ `_tool_name()` RESOLVES THE NAME FOR BOTH ROW KINDS, from one function.
 Gemini rejects a `function_response` whose name does not match its
@@ -90,6 +93,7 @@ from agent2.config import (
     supports_thinking,
 )
 from agent2.database import qall, qone, exe
+from agent2.core.context import MSG_ORDER_DESC
 from agent2.llm.keys import rotator
 from agent2.llm import router
 from agent2.llm.resilience import (
@@ -105,13 +109,14 @@ from agent2.core import workspace as _workspace
 from agent2.core import diffs as _diffs
 from agent2.core import recovery as _recovery
 from agent2.core import broker as _broker
+from agent2.core import metrics as _metrics
 from agent2.core.progress import TurnProgress, stage_for_tool
 
 # Local (non-shell, non-Burp) tools dispatched via agent2.tools.dispatch_tool
 _LOCAL_TOOLS = {
     "read_file", "write_file", "web_search", "save_memory", "emit_plan",
     "scan_project", "multi_edit_files", "list_dir", "delete_file",
-    "grep_search", "update_todo",
+    "grep_search", "update_todo", "update_project_doc",
     # File Intelligence System
     "detect_file", "file_capabilities", "run_file_op", "convert_file",
     "search_workspace",
@@ -150,6 +155,7 @@ _TOOL_LABELS: dict[str, Callable[[dict], str]] = {
     "save_memory":      lambda a: "Saving memory",
     "emit_plan":        lambda a: f"Planning: {a.get('title','?')}",
     "update_todo":      lambda a: "Updating task list",
+    "update_project_doc": lambda a: "📝 Updating .agent2/agent2.md",
     "detect_file":      lambda a: f"🔍 Detecting: {_short_path(a.get('path','?'))}",
     "multi_edit_files": lambda a: f"✍ Editing {_edit_count(a)} file(s)",
     "file_capabilities": lambda a: (
@@ -192,6 +198,14 @@ _TOOL_RESULT_SUMMARIES: dict[str, Callable[[dict], str | None]] = {
                               + "\n".join(r.get("matches", []))),
     "scan_project": lambda r: f"Scanned {r.get('file_count',0)} files\n{r.get('file_tree','')}",
     "update_todo": _todo_summary,
+    "update_project_doc": lambda r: (
+        "Project doc unchanged — nothing in the project's structure moved."
+        if not r.get("changed") else
+        "Project doc updated"
+        + (f"; refreshed: {', '.join(r.get('sections_updated') or [])}"
+           if r.get("sections_updated") else "")
+        + (f"; added: {', '.join(r.get('sections_added') or [])}"
+           if r.get("sections_added") else "")),
     "multi_edit_files": lambda r: r.get("results", "done"),
     "delete_file": lambda r: f"Deleted {r.get('deleted','?')}",
 }
@@ -376,6 +390,24 @@ def _build_static_prompt() -> str:
 - Build ENTIRE projects from a single prompt: create the full directory structure and EVERY file with `write_file`, install deps and run the project with `run_command`, then confirm it works.
 - If a command fails, read the error, fix the cause, and re-run — autonomously. Iterate until green.
 
+## THE PROJECT DOC — `.agent2/agent2.md` is this project's own brief
+- If a `## PROJECT INSTRUCTIONS (.agent2/agent2.md)` section appears above, that IS this
+  project: its purpose, features, architecture, commands and conventions. READ IT FIRST and
+  work from it instead of re-deriving the project from scratch. It outranks your general
+  defaults; it does not outrank the user's message.
+- Trust it, then verify what you touch: it describes the project as of the last refresh, so
+  if a file it names is gone, believe the disk and refresh the doc.
+- **KEEP IT TRUE.** After you finish work that changed what this project *contains* — a new
+  feature, module, entry point, dependency, command, test suite, or a restructure — call
+  `update_project_doc` as one of your last steps. Then say in your reply that you updated it.
+  Add `describe: true` only when you changed what the project IS FOR (a new purpose or a
+  headline feature), because that re-narrates Purpose/Features/Architecture.
+- Do NOT call it after read-only work, a one-line fix, or a question — a doc that churns on
+  every turn stops being read. It preserves anything a human wrote, so refreshing is safe.
+- If there is no such section, this project has no doc yet: create one with
+  `update_project_doc` when you have just scaffolded or substantially built the project (or
+  when the user asks); otherwise leave the workspace alone and mention `/init`.
+
 ## TOOLS (use them — never just print code and stop)
 - `update_todo` — live task checklist; call first for multi-step work, update as you progress
 - `scan_project` / `list_dir` / `grep_search` / `read_file` — explore before editing
@@ -386,6 +418,8 @@ def _build_static_prompt() -> str:
 - `web_search` — docs, CVEs, errors, latest info
 - `save_memory` — persist important facts
 - `emit_plan` — show a plan for a complex task
+- `update_project_doc` — re-scan the project and refresh `.agent2/agent2.md` after you changed
+  what it contains (see above)
 
 ## FILE INTELLIGENCE — understand & process any file
 Agent2 has a universal file-processing system. For ANY file the user references
@@ -505,6 +539,13 @@ def build_context(chat_id: str) -> list[types.Content]:
     tool_call, which the pairing rule below silently dropped). `rowid` is the
     monotonic insertion order, so it is the real tie-break.
 
+    Pairing is BOTH ways. A `function_call` needs its `function_response` and a
+    `function_response` needs its `function_call`; Gemini rejects either half
+    alone. The forward guard was here from the start, but the backward one was
+    not — and the window is a `LIMIT` off the newest end, so its oldest row is
+    whatever the count landed on. Land it on a tool_result and the emitted
+    context OPENED with an orphan response, which fails the turn at the vendor.
+
     This runs on every agent iteration, so it stays a single LIMITed query and a
     single pass: `meta` is parsed only for the tool rows that read it (a text
     conversation parses none), and the six near-identical `types.Content`
@@ -513,7 +554,7 @@ def build_context(chat_id: str) -> list[types.Content]:
     """
     rows = qall(
         "SELECT id, role, content, meta FROM messages "
-        "WHERE chat_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        f"WHERE chat_id=? {MSG_ORDER_DESC} LIMIT ?",
         (chat_id, MAX_CTX_MESSAGES),
     )
     rows.reverse()
@@ -542,6 +583,17 @@ def build_context(chat_id: str) -> list[types.Content]:
                 ))
 
         elif role == "tool_result":
+            # The mirror of the rule above, and it is NOT redundant: the window
+            # is `LIMIT MAX_CTX_MESSAGES` off the newest end, so its oldest row
+            # is wherever the count landed — and when that is a tool_result, its
+            # tool_call is the row that fell off the front. Gemini rejects a
+            # function_response with no matching function_call exactly as it
+            # rejects the reverse, so without this the FIRST Content of a long
+            # tool-using conversation is an orphan and the whole turn dies at the
+            # vendor. Skipping only the tool_call was self-consistent and half a
+            # rule.
+            if i == 0 or rows[i - 1]["role"] != "tool_call":
+                continue
             meta = json.loads(r.get("meta") or "{}")
             response = {"output": content[:MAX_TOOL_OUTPUT]}
             if meta.get("burp"):
@@ -907,8 +959,9 @@ def run_agent(
     # ONE assembly per turn, not per iteration: the situational sources read the
     # filesystem, git and the task table, and the prompt they build is reused for
     # every one of up to MAX_AGENT_ITERS calls. `assemble()` is total — a source
-    # that fails is recorded on `bundle.errors` and simply absent — so there is no
-    # failure mode here that can end a turn.
+    # that fails is recorded on `bundle.errors`, logged there (one place, for the
+    # reason its docstring gives) and simply absent — so there is no failure mode
+    # here that can end a turn.
     bundle = _broker.assemble(
         chat_id=chat_id,
         message=sent_message,
@@ -919,9 +972,6 @@ def run_agent(
         conversation_tokens=router.estimate_tokens(
             "".join(p.text or "" for c in context for p in (c.parts or []))),
     )
-    if bundle.errors:
-        for _src, _err in bundle.errors.items():
-            alog.context_source_failed(_src, _err)
 
     cfg_kwargs: dict = {
         "system_instruction": system_prompt(
@@ -1135,12 +1185,26 @@ def run_agent(
             return
 
         # ── Extract text + function call ──────────────────────────────────────
+        # ⚠️ ONE CALL PER ITERATION, AND IT IS THE **FIRST** ONE. Gemini may
+        # return several `function_call` parts in a single response (parallel
+        # function calling), and this loop appends its own reconstructed
+        # call/result pair to `context` per iteration — so the calls it does not
+        # run were never shown to the model as asked, and the model re-issues
+        # what it still needs on the next round trip. That degradation is fine;
+        # taking the LAST one was not, because it INVERTS the order the model
+        # asked for. `write_file` then `run_command` ran as `run_command` then
+        # `write_file`, which is a wrong answer with no error anywhere.
+        # The extras are logged rather than dropped in silence.
         func_call: types.FunctionCall | None = None
+        extra_calls = 0
         texts: list[str] = []
         for idx, p in enumerate(parts):
             try:
                 if p.function_call and p.function_call.name:
-                    func_call = p.function_call
+                    if func_call is None:
+                        func_call = p.function_call
+                    else:
+                        extra_calls += 1
                 elif p.text and not getattr(p, "thought", False):
                     texts.append(p.text)
             except Exception as exc:
@@ -1155,6 +1219,10 @@ def run_agent(
                 # `alog.event` is itself guaranteed non-raising.
                 alog.event("agent.part_skipped", index=idx,
                            error=f"{type(exc).__name__}: {exc}")
+        if extra_calls:
+            alog.event("agent.parallel_calls_deferred", chat=chat_id,
+                       kept=func_call.name if func_call else "",
+                       deferred=extra_calls)
 
         # ── Token accounting ──────────────────────────────────────────────────
         try:
@@ -1162,6 +1230,7 @@ def run_agent(
         except Exception:
             tok = 0
         total_tokens += tok
+        _metrics.tokens(model_key, tok)
         if tok and key_label:
             rotator.record_usage(key_label, tok)
             socketio.emit("key_usage_update",

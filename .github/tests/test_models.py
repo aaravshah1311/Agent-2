@@ -1131,6 +1131,267 @@ def test_a_cooling_model_is_last_in_the_cli_order_not_absent(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# A fallback is a `continue`, not a restart — the CLI's half of rule 20
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️ THE ASSERTIONS THIS FILE'S OWN DOCSTRING CALLS ITS MOST VALUABLE ONES.
+# `agent.py`'s fallback is a `continue` inside a loop. The CLI's two loops are
+# *functions*, so falling back means CALLING one again — and calling `run_agent`
+# again rebuilds the context from scratch and re-enters at iteration 0. Both loops
+# raise `ModelUnavailable` from INSIDE their iteration loop, so a quota error
+# routinely arrives after this turn's `write_file` / `delete_file` / `run_command`
+# have already happened. `del history[base_len:]` rolls back the ROWS; nothing
+# rolls back a deleted file.
+#
+# Everything below drives the real `agent_turn` with a fake loop standing in for
+# `_one_model_turn`, so what is pinned is the driver's decisions. Where behaviour
+# cannot be reached without a live key the assertion is on the PARSED TREE, never
+# on source text — this repo has been bitten twice by assertions a docstring
+# happened to satisfy.
+
+
+def _drive(monkeypatch, order: list, outcomes: dict):
+    """Stub the fallback driver's collaborators; return its recorded traffic.
+
+    *outcomes* maps a candidate to ``(kind, tools_ran)`` — ``kind`` is ``"raise"``
+    (report `exhausted`, hand the turn state back) or ``"ok"`` (answer the turn).
+
+    The fake loop appends a user row **stamped with its own model key**, exactly
+    where both real loops append one during setup. That stamp is the whole trick:
+    a continued turn keeps the FIRST model's row, a restarted one rolls it back
+    and re-appends the next model's. The two are otherwise the same shape, so a
+    test that only counted rows would pass either way.
+    """
+    import agent2cli
+
+    calls: list = []    # (model, resume) per invocation
+    states: list = []   # every _TurnState the fake created
+    lines: list = []    # what the user was told
+
+    def fake_turn(user_input, history, model, mode, send_msg=None, resume=None):
+        calls.append((model, resume))
+        kind, tools_ran = outcomes[model]
+        if resume is None:
+            history.append({"role": "user", "content": f"{user_input}#{model}"})
+            state = agent2cli._TurnState("gemini", context=[f"ctx:{model}"])
+            state.tools_ran = bool(tools_ran)
+            states.append(state)
+        else:
+            state = resume
+        if kind == "raise":
+            raise agent2cli.ModelUnavailable("exhausted", "no keys left", state=state)
+        history.append({"role": "assistant", "content": f"answered by {model}"})
+        return history
+
+    monkeypatch.setattr(agent2cli, "_fallback_order", lambda _current: list(order))
+    monkeypatch.setattr(agent2cli, "_pil_process", lambda text: text)
+    monkeypatch.setattr(agent2cli, "status_line",
+                        lambda msg, kind="info": lines.append(str(msg)))
+    monkeypatch.setattr(agent2cli, "_one_model_turn", fake_turn)
+    return calls, states, lines
+
+
+def _canary_provider(fmt: str = "openai") -> str:
+    """A real `custom:<id>` key, so the report's wording is the user's own."""
+    from agent2.llm import providers as P
+    P.init_providers_table()
+    return P.add_provider("CANARY-PROV", "https://x.invalid/v1", "k", "m", fmt)["key"]
+
+
+def test_a_fallback_continues_a_turn_whose_tools_already_ran(monkeypatch):
+    """⚠️ THE DEFECT THIS MECHANISM EXISTS TO STOP: the next model used to be
+    handed the user's message alone, and re-issued every `write_file`,
+    `delete_file` and `run_command` the failed attempt had already executed."""
+    import agent2cli
+    first, second = _keys()[0], _second()
+    calls, states, lines = _drive(monkeypatch, [first, second],
+                                  {first: ("raise", True), second: ("ok", False)})
+
+    history = [{"role": "user", "content": "an older turn"}]
+    out, used = agent2cli.agent_turn("write the file", history, first, "pro")
+
+    assert used == second
+    assert [m for m, _ in calls] == [first, second]
+    assert calls[1][1] is states[0], \
+        "the next model was started fresh instead of continuing the half-finished turn"
+    # No rollback: the row the failed attempt appended is the one on record, because
+    # the carried context already holds it.
+    assert [r["content"] for r in out] == [
+        "an older turn", f"write the file#{first}", f"answered by {second}"]
+    assert any("Continuing on" in ln for ln in lines), \
+        "the user was told the turn was restarted when it was continued"
+
+
+def test_a_fallback_still_restarts_cleanly_when_no_tool_had_run(monkeypatch):
+    """The free restart is PRESERVED — carrying a turn is the exception, not the new
+    default. Nothing has happened yet, so the partial rows go and the next model
+    starts clean."""
+    import agent2cli
+    first, second = _keys()[0], _second()
+    calls, _states, lines = _drive(monkeypatch, [first, second],
+                                   {first: ("raise", False), second: ("ok", False)})
+
+    history = [{"role": "user", "content": "an older turn"}]
+    out, used = agent2cli.agent_turn("say hello", history, first, "pro")
+
+    assert used == second
+    assert calls[1][1] is None, "a turn with no side effects must not be carried"
+    assert [r["content"] for r in out] == [
+        "an older turn", f"say hello#{second}", f"answered by {second}"], \
+        "the failed attempt's rows were left behind instead of rolled back"
+    assert any("Trying" in ln for ln in lines)
+
+
+def test_a_carried_gemini_turn_is_never_handed_to_a_custom_provider(monkeypatch):
+    """⚠️ A `_TurnState` is a half-built request in ONE wire format. Handing a
+    Gemini `Content` list to the OpenAI loop is not a fallback, it is a crash — so a
+    candidate that cannot take the turn is skipped and the turn continues on the
+    next one that can."""
+    import agent2cli
+    other = _canary_provider()
+    first, second = _keys()[0], _second()
+
+    calls, states, _lines = _drive(monkeypatch, [first, other, second],
+                                   {first: ("raise", True), second: ("ok", False)})
+    out, used = agent2cli.agent_turn("write the file", [], first, "pro")
+
+    assert used == second
+    assert [m for m, _ in calls] == [first, second], \
+        "the provider loop was handed a Gemini turn state"
+    assert calls[1][1] is states[0]
+    assert [r["content"] for r in out] == [
+        f"write the file#{first}", f"answered by {second}"]
+
+
+def test_a_skipped_candidate_is_named_and_nothing_is_replayed(monkeypatch):
+    """⚠️ `skills.select.REASONS`' rule, candidate-shaped: a model absent from the
+    report with no stated reason is indistinguishable from a broken fallback order.
+    And when the turn can travel no further the driver STOPS — reporting a failure
+    is recoverable, replaying a delete is not."""
+    import agent2cli
+    other = _canary_provider()
+    first = _keys()[0]
+
+    calls, _states, lines = _drive(monkeypatch, [first, other], {first: ("raise", True)})
+    out, used = agent2cli.agent_turn("delete the file", [], first, "pro")
+
+    assert [m for m, _ in calls] == [first], "the skipped candidate was tried anyway"
+    assert used == first
+    blob = "\n".join(lines)
+    assert "Not tried" in blob and "CANARY-PROV" in blob, \
+        "a candidate was dropped from the fallback with no stated reason"
+    assert "nothing was replayed" in blob
+    # The turn's own row survives — it is what those tool calls were made against.
+    assert [r["content"] for r in out] == [f"delete the file#{first}"]
+
+
+def test_a_turn_state_may_only_be_inherited_by_a_loop_of_the_same_shape():
+    """The predicate the driver skips on. ⚠️ Total by contract: it is asked while a
+    turn is already failing, so an unknown provider means "cannot inherit", never a
+    second exception."""
+    import agent2cli
+    from agent2.llm import providers as P
+    P.init_providers_table()
+    oa = P.add_provider("oa", "https://a.invalid/v1", "k", "m", "openai")["key"]
+    an = P.add_provider("an", "https://b.invalid/v1", "k", "m", "anthropic")["key"]
+
+    gem = agent2cli._TurnState("gemini")
+    assert gem.inheritable_by(_keys()[0]) is True
+    assert gem.inheritable_by(oa) is False
+    assert gem.inheritable_by("custom:no-such-provider") is False
+
+    st = agent2cli._TurnState("openai")
+    assert st.inheritable_by(oa) is True
+    assert st.inheritable_by(an) is False, \
+        "an anthropic provider cannot continue a turn built in OpenAI's format"
+    assert st.inheritable_by(_keys()[0]) is False, \
+        "a provider turn cannot be continued by the Gemini loop"
+    assert st.inheritable_by("custom:no-such-provider") is False
+
+
+def test_one_model_turn_forwards_the_carried_state_to_the_matching_loop(monkeypatch):
+    """The thread between the driver and the two loops. A dispatcher that dropped
+    `resume` would make every test above pass and still replay every tool call."""
+    import agent2cli
+    seen: dict = {}
+
+    def fake_gemini(*a):
+        seen["gemini"] = a
+        return "G"
+
+    def fake_provider(*a):
+        seen["provider"] = a
+        return "P"
+
+    monkeypatch.setattr(agent2cli, "run_agent", fake_gemini)
+    monkeypatch.setattr(agent2cli, "run_provider_agent_cli", fake_provider)
+
+    gem = agent2cli._TurnState("gemini")
+    assert agent2cli._one_model_turn("hi", [], _keys()[0], "pro", "hi", gem) == "G"
+    assert seen["gemini"][-1] is gem
+
+    prov = agent2cli._TurnState("openai")
+    assert agent2cli._one_model_turn("hi", [], "custom:abc", "pro", "hi", prov) == "P"
+    assert seen["provider"][-1] is prov
+    assert seen["provider"][2] == "abc", "the provider id was not unwrapped from the key"
+
+
+def test_every_cli_model_unavailable_raise_carries_the_turn_state():
+    """⚠️ A `ModelUnavailable` with no `state=` IS the defect: the driver then has
+    nothing to continue, falls into the rollback branch and restarts the turn on the
+    next model, replaying every tool call that already ran. Asserted on the parsed
+    tree, because a raise site is reached only with a live key and an exhausted
+    quota — and because a text search would be satisfied by a docstring."""
+    import ast
+    import inspect
+
+    import agent2cli
+
+    tree = ast.parse(inspect.getsource(agent2cli))
+    raises = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call)
+              and isinstance(n.exc.func, ast.Name)
+              and n.exc.func.id == "ModelUnavailable"]
+    assert raises, "nothing raises ModelUnavailable any more — the fallback is dead"
+    for node in raises:
+        assert "state" in {k.arg for k in node.exc.keywords}, (
+            f"agent2cli.py:{node.lineno} raises ModelUnavailable with no state= — "
+            "the caller cannot continue this turn and will replay its tool calls")
+
+
+@pytest.mark.parametrize(("fn_name", "executors"), [
+    ("run_agent", {"dispatch_tool", "run_cmd_stream"}),
+    ("run_provider_agent_cli", {"_run_tool_cli"}),
+])
+def test_tools_ran_is_latched_before_the_first_tool_runs(fn_name, executors):
+    """⚠️ `tools_ran` IS THE GATE, and latching it after the batch would reopen the
+    bug for the worst case: a cancel or a raise part-way through a batch still
+    leaves files written and files deleted on disk, and the driver would read the
+    turn as untouched and restart it. Both loops latch it before the first
+    executor call — pinned by line order on the parsed tree, since reaching a real
+    tool dispatch needs a live key."""
+    import ast
+    import inspect
+
+    import agent2cli
+
+    tree = ast.parse(inspect.getsource(agent2cli))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    latch = [n.lineno for n in ast.walk(fn)
+             if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Attribute) and t.attr == "tools_ran"
+                     for t in n.targets)]
+    runs = [n.lineno for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in executors]
+    assert latch, f"{fn_name} never latches tools_ran — a fallback will replay its tools"
+    assert runs, f"{fn_name} no longer calls {sorted(executors)} — update this test"
+    assert min(latch) < min(runs), (
+        f"{fn_name} runs a tool at line {min(runs)} before latching tools_ran at "
+        f"line {min(latch)} — a mid-batch failure would be read as an untouched turn")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # The HTTP surface
 # ══════════════════════════════════════════════════════════════════════════════
 

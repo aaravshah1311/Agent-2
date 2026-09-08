@@ -39,11 +39,11 @@ SECOND deliberate `r` to fire. Anything that made this a gate would put a human 
 the critical path of every turn.
 
 ⚠️ OPENING THE VIEWER WRITES NOTHING, AND `[E] Edit` DOES NOT FEED THE STORE.
-`store` is "what the agent changed"; recording a human's own edit there would make
-`revert_change`'s reconstructed before-side wrong, so an `E` round trip is
-deliberately invisible to it. The whole-file view (`f`) re-reads disk, so the user
-still sees their edit — the unified diff keeps showing the agent's change, which is
-the thing the viewer exists to show.
+`store` is "what the agent changed", so a human's own edit is deliberately invisible
+to it: recording one would make `r` offer to undo a change the agent never made. The
+edit is still *visible* — the whole-file view (`f`) re-reads disk — and the agent's
+own undo stays honest either way, because `core.diffs.revert_text` checks each hunk
+against the file in hand and refuses once a hand edit has moved it.
 
 Layer: core.diffs / core.highlight / env / theme / render → diffview.
 """
@@ -62,6 +62,7 @@ from agent2.core.diffs import (          # THE shared engine — never re-implem
     capture_for,
     capture_write,
     compute_change,
+    revert_text,
     store,
     summarize,
 )
@@ -242,8 +243,10 @@ def _render_change(ch: FileChange, context_lines: bool, preview: bool) -> None:
     #
     # ⚠️ `~modified` IS A COUNT, NOT A ROW TAG. "Yellow = modifications" is this
     # paired total (`min(added, removed)`) plus the `@@` marker; there is no fifth
-    # tag, because two WRITERS depend on the tag set being exactly `TAGS` — see
-    # `revert_change` below and `to_patch`.
+    # tag, because two READERS depend on the tag set being exactly `TAGS` —
+    # `core.diffs.hunks_of` (which is what `r`'s undo runs on) rebuilds each hunk's
+    # two sides from these four names and REFUSES on any other, and `to_patch` has
+    # no unified-diff sigil to emit for a fifth one.
     #
     # Colours come from `_ROW_HEX`/`_ROW_ANSI` rather than repeated literals: green
     # means added in this module in exactly one place.
@@ -519,23 +522,40 @@ def full_rows(ch: FileChange) -> list[tuple[str, str, int | None]]:
 def revert_change(ch: FileChange) -> bool:
     """Undo one change by restoring the file's pre-change content.
 
-    Reconstructed from the diff: context + deleted rows ARE the "before" side.
-    Refuses on a truncated diff, because the reconstruction would be partial and
-    writing it would DESTROY the parts of the file the diff never captured.
+    ⚠️ THE UNDO REVERSE-APPLIES THE HUNKS TO THE FILE ON DISK — it does not rebuild
+    the file out of the diff. `ch.lines` is an `n=3` window, so its `del`+`ctx` rows
+    are the whole pre-change file only when the file was small enough to fit inside
+    its own hunks. That rebuild shipped, and on a 200-line file with one changed line
+    it wrote 7 lines and returned True. `core.diffs.revert_text` owns the computation
+    (one declaration); this function is the disk actor.
+
+    Refuses — writing nothing — when the rows cannot be read as hunks, when any
+    hunk's after-side does not match what is on disk (the file moved on, so we no
+    longer recognise what we would be overwriting), and when `ch.truncated`, because
+    the rows past `MAX_DIFF_LINES` were never captured and the hunks that would have
+    restored them are missing.
     """
     try:
         if not ch or ch.binary or ch.truncated:
             return False
+        p = Path(ch.path)
         if ch.kind == "create":
             # It didn't exist before; undoing means removing it.
-            p = Path(ch.path)
             if p.exists():
                 p.unlink()
             return True
-        before = [t for tag, t in ch.lines if tag in ("del", "ctx")]
-        if not before and ch.kind != "delete":
+        try:
+            current = p.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            # An undone delete: the file is gone, and "" is exactly what the diff's
+            # after-side says it should be.
+            current = "" if ch.kind == "delete" else None
+        if current is None:
             return False
-        Path(ch.path).write_text("\n".join(before) + "\n", encoding="utf-8")
+        text = revert_text(ch, current)
+        if text is None:
+            return False
+        p.write_text(text, encoding="utf-8")
         return True
     except Exception:
         return False
@@ -667,8 +687,8 @@ def open_viewer(changes: list[FileChange] | None = None,
         if open_in_editor(changes[idx].path):
             # ⚠️ Deliberately NOT re-captured into `store`. See the module header:
             # the store is the agent's changes, and a human edit recorded there
-            # would corrupt `revert_change`'s before-side. `f` re-reads disk, so
-            # the edit is visible without being claimed as the agent's.
+            # would make `r` offer to undo something the agent never wrote. `f`
+            # re-reads disk, so the edit is visible without being claimed.
             edited.add(idx)
             note = "edited in your editor — press f to see the file on disk"
         else:
@@ -1118,7 +1138,12 @@ def _run_viewer(changes: list[FileChange], dropped: int = 0,
             _note("marked rejected — press r again to revert this file on disk")
             return
         ok = revert_change(ch)
-        _note("reverted on disk" if ok else "could not revert this change")
+        # ⚠️ The failure half names the likely cause and states the invariant. The
+        # undo verifies every hunk against the file in hand first, so the ordinary
+        # refusal is "the file moved on" — and in every refusal nothing was written,
+        # which is the one fact the user needs before deciding what to do next.
+        _note("reverted on disk" if ok else
+              "could not revert — nothing written; the file may have changed since")
 
     @kb.add("E")
     def _(event):

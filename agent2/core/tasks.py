@@ -63,6 +63,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from agent2 import database as db
+from agent2.core import metrics as _metrics
 from agent2.core import sync
 
 # ── States ────────────────────────────────────────────────────────────────────
@@ -95,6 +96,19 @@ TERMINAL = frozenset((TaskStatus.COMPLETED, TaskStatus.FAILED,
 # Counts toward "still to do".
 OPEN = frozenset((TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING,
                   TaskStatus.PAUSED))
+
+# "Some worker is holding this row" — the two statuses worker recovery sweeps, and
+# the ones `interrupt()` parks. A tuple, because it is spliced into SQL and the
+# parameter order has to be deterministic.
+#
+# ⚠️ QUEUED BELONGS HERE AND PAUSED DOES NOT, AND THAT IS NOT A SPECTRUM. QUEUED
+# has exactly one writer — `core/dag/store.claim()`, where the status write *is*
+# the lock — so it means "a scheduler took this and is about to mark it RUNNING",
+# never "a human decided something". PAUSED is where `interrupt()` parks a task and
+# where `/pause` puts a hold somebody chose, so sweeping it would hand recovery
+# every chat the user paused on purpose. See `stale_running()` for what a claimed
+# row that never reached RUNNING costs.
+HELD = (TaskStatus.RUNNING, TaskStatus.QUEUED)
 
 # What the model is allowed to say, mapped onto our vocabulary. The tool schema
 # has always advertised pending|in_progress|completed, so those three must keep
@@ -147,6 +161,18 @@ GLYPHS = {
 MAX_TITLE = 200
 MAX_TEXT = 4000
 DEFAULT_PRIORITY = 5
+
+# How long a `HELD` task (RUNNING or QUEUED) may go untouched before
+# `stale_running()` calls it stuck. ⚠️ ONE declaration: it is `stale_running`'s
+# default *and* the number `stats()` reports, because a health payload that names a
+# threshold different from the one the sweep applied describes a sweep that never
+# ran.
+STALE_AFTER = 90.0
+
+# Ceiling on the stale sweep a `stats()` read performs. A health endpoint may not
+# turn into an unbounded scan of every held row, so the count is reported
+# alongside the ceiling that produced it — see `stats()`.
+STALE_SAMPLE = 200
 
 
 def _now() -> str:
@@ -247,6 +273,16 @@ class Task:
     result: str = ""
     error: str = ""
     checkpoint: dict = field(default_factory=dict)
+    # Task 24 §2's durable recovery fields (migrations 23–26). ⚠️ `updated_at` is
+    # the ONE of the four that every writer maintains, because it is the one worker
+    # recovery asks about: a task whose row has not changed since the cutoff, while
+    # still marked RUNNING, is a task whose worker did not survive. The other three
+    # are stamped by whoever claims the task and are informational — a recovery
+    # report can name the process and the operation instead of only the task.
+    updated_at: str = ""
+    last_heartbeat: str = ""
+    worker_id: str = ""
+    execution_id: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> Task:
@@ -268,6 +304,10 @@ class Task:
             result=str(row.get("result") or ""),
             error=str(row.get("error") or ""),
             checkpoint=_jload(row.get("checkpoint"), {}),
+            updated_at=str(row.get("updated_at") or ""),
+            last_heartbeat=str(row.get("last_heartbeat") or ""),
+            worker_id=str(row.get("worker_id") or ""),
+            execution_id=str(row.get("execution_id") or ""),
         )
 
     @property
@@ -304,6 +344,10 @@ class Task:
             "result": self.result,
             "error": self.error,
             "checkpoint": dict(self.checkpoint),
+            "updated_at": self.updated_at,
+            "last_heartbeat": self.last_heartbeat,
+            "worker_id": self.worker_id,
+            "execution_id": self.execution_id,
         }
 
 
@@ -519,13 +563,21 @@ def payload(session_id: str) -> dict:
     }
 
 
-def ready(session_id: str) -> list[Task]:
+def ready(session_id: str, tasks: list[Task] | None = None) -> list[Task]:
     """Open tasks whose dependencies have all settled, best-priority first.
 
     Unresolvable dependencies (an id that no longer exists) are ignored rather
     than treated as blocking — a dangling reference must not deadlock a plan.
+
+    A caller that already holds the session's rows may pass them as *tasks*, the
+    same way `blockers()` accepts a pool: `core.workflow.runner.state_for()` needs
+    both the full list and the runnable subset on the turn path, and re-reading the
+    same rows to answer the second question is a query nobody needs. ⚠️ It is a
+    pool, never a *predicate*: this function stays the one declaration of what
+    "ready" means, because a second copy in a caller would release a blocked node
+    to run out of order with a plausible result and no error anywhere.
     """
-    tasks = list_tasks(session_id)
+    tasks = list_tasks(session_id) if tasks is None else tasks
     by_id = {t.id: t for t in tasks}
     out = []
     for t in tasks:
@@ -571,14 +623,14 @@ def create(session_id: str, title: str, *, description: str = "",
         "INSERT INTO agent_tasks"
         " (id, session_id, parent_task_id, seq, title, description, status,"
         "  priority, dependencies, created_at, started_at, completed_at,"
-        "  attempt_count, progress, result, error, checkpoint)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "  attempt_count, progress, result, error, checkpoint, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (tid, str(session_id), _text(parent_task_id, MAX_TITLE), int(seq), title,
          _text(description), status, _int(priority, DEFAULT_PRIORITY),
          _jdump([str(d) for d in (dependencies or [])]), now,
          now if status == TaskStatus.RUNNING else "",
          now if status in TERMINAL else "",
-         0, 0.0, "", "", _jdump(checkpoint or {})),
+         0, 0.0, "", "", _jdump(checkpoint or {}), now),
     )
     if notify:
         touch_session(session_id)
@@ -587,11 +639,29 @@ def create(session_id: str, title: str, *, description: str = "",
 
 
 def _apply(task: Task, status: str, *, result=None, error=None,
-           progress=None, checkpoint=None, bump_attempt: bool = False) -> Task:
+           progress=None, checkpoint=None, bump_attempt: bool = False,
+           worker_id=None, execution_id=None, beat: bool = False) -> Task:
     """The ONE status writer. Every transition helper funnels through here so the
-    timestamp/attempt bookkeeping cannot drift between them."""
+    timestamp/attempt bookkeeping cannot drift between them.
+
+    ⚠️ `updated_at` IS STAMPED HERE, UNCONDITIONALLY, AND THAT IS WHY THIS HAS TO
+    STAY THE ONLY WRITER. It is the sole input to `stale_running()`, so a second
+    UPDATE that forgot it would leave a live task looking untouched — and worker
+    recovery would report a task some worker is happily working on as interrupted.
+    That failure is silent in the worst direction: the row is real, the timestamps
+    look plausible, and only the *conclusion* is wrong.
+
+    ⚠️ IT IS ALSO WHERE `task.duration` IS MEASURED (Task 27), for that same
+    single-writer reason, and it is measured from the row's own two stamps —
+    `spanned()`, not a monotonic clock. A task is durable and may outlive the
+    process that started it, so `time.monotonic()` at start would be unreadable
+    after a restart, and a `started_mono` column would be a second declaration of
+    when the task began. The label is the terminal status, so "how long does a
+    task take" and "how long does a task take *to fail*" are separate answers.
+    """
     sets = {"status": status}
     now = _now()
+    sets["updated_at"] = now
     if status == TaskStatus.RUNNING:
         if not task.started_at:
             sets["started_at"] = now
@@ -610,9 +680,17 @@ def _apply(task: Task, status: str, *, result=None, error=None,
         sets["progress"] = _clamp01(_float(progress, task.progress))
     if checkpoint is not None:
         sets["checkpoint"] = _jdump(checkpoint)
+    if worker_id is not None:
+        sets["worker_id"] = _text(worker_id, MAX_TITLE)
+    if execution_id is not None:
+        sets["execution_id"] = _text(execution_id, MAX_TITLE)
+    if beat:
+        sets["last_heartbeat"] = now
     cols = ", ".join(f"{k}=?" for k in sets)
     db.exe(f"UPDATE agent_tasks SET {cols} WHERE id=?",
            (*sets.values(), task.id))
+    if status in TERMINAL and task.started_at:
+        _metrics.spanned(_metrics.TASK_DURATION, task.started_at, now, status)
     return get(task.id)
 
 
@@ -686,6 +764,42 @@ def set_progress(task_id: str, progress: float, notify: bool = True) -> Task | N
     return out
 
 
+def set_dependencies(task_id: str, dependencies, *, task: Task | None = None,
+                     notify: bool = True) -> Task | None:
+    """Rewrite one task's `dependencies`. THE writer for that column.
+
+    Dependencies are *structure*, not state, so this is deliberately **not** routed
+    through `_apply()` and carries no terminal guard: `_apply`'s refusal protects a
+    settled row's *status*, and a caller that must protect a settled row's *edges*
+    owns a different rule (`core.dag.validate.validate_mutation` is one, and it
+    refuses before reaching this function). Ordering a plan is not the same act as
+    claiming to have run it.
+
+    ⚠️ `task=` exists so a caller holding the row pays no extra read — the pattern
+    `ready(session_id, tasks=None)` and `blockers(task, tasks=None)` already use in
+    this module, and the reason `sync_list()` can delegate here inside its own
+    `db.batch()` without adding a query per item. A self-dependency is dropped
+    rather than refused, exactly as `_resolve_deps` drops one: a node that waits for
+    itself never becomes ready, and `ready()` would report that as *blocked* forever
+    with nothing to point at.
+    """
+    if not task_id:
+        return None
+    row = task if task is not None else get(task_id)
+    if row is None:
+        return None
+    want = [str(d) for d in (dependencies or []) if str(d) and str(d) != row.id]
+    if want == list(row.dependencies):
+        return row
+    db.exe("UPDATE agent_tasks SET dependencies=?, updated_at=? WHERE id=?",
+           (_jdump(want), _now(), row.id))
+    row.dependencies = want
+    if notify:
+        sync.notify("tasks", session_id=row.session_id, task_id=row.id,
+                    event="dependencies")
+    return row
+
+
 def cancel_open(session_id: str, reason: str = "") -> int:
     """Cancel every still-open task of a session (Ctrl+C / stop_agent).
 
@@ -702,9 +816,10 @@ def cancel_open(session_id: str, reason: str = "") -> int:
         return 0
     with db.batch():
         db.exe(
-            f"UPDATE agent_tasks SET status=?, completed_at=?, error=?"
+            f"UPDATE agent_tasks SET status=?, completed_at=?, error=?,"
+            f" updated_at=?"
             f" WHERE session_id=? AND status IN ({marks})",
-            (TaskStatus.CANCELLED, _now(), _text(reason), str(session_id),
+            (TaskStatus.CANCELLED, _now(), _text(reason), _now(), str(session_id),
              *sorted(OPEN)),
         )
     sync.notify("tasks", session_id=session_id, event="cancelled")
@@ -753,6 +868,32 @@ CP_STOPPED = "stopped"
 # "reason", "checks"}. Stored rather than derived because "this task was resumed
 # after a crash" is a fact about history that nothing else on disk records.
 CP_RECOVERED = "recovered"
+# Written by `core/workflow/runner.instantiate()` (Task 37): which workflow run this
+# task belongs to, and which node of that workflow it IS.
+#
+# ⚠️ THIS IS THE ONLY DURABLE LINK FROM A NODE ID TO A TASK ID, and it lives on the
+# task rather than in `exec_workflows.state` on purpose. The graph speaks node ids
+# (`build`, `test`) while `agent_tasks.dependencies` holds task ids, so a remap
+# happens exactly once, at creation. Keeping the reverse map in the run row would
+# put it under `execstate.MAX_STATE_CHARS`, which degrades an over-long blob to
+# `"{}"` — and a workflow that lost its node names would resume by re-running work
+# it had already finished, silently, which is the one thing Task 42 forbids. On the
+# row it describes, the mapping cannot be truncated away and cannot outlive it.
+CP_WORKFLOW = "workflow"
+CP_NODE = "node"
+# Written by `core/dag/store.py` (Phase D1) alongside the two above: the node's
+# `kind` (an extensible type label the DAG core itself never branches on) and its
+# `resource` (the mutual-exclusion token the scheduler honours).
+#
+# ⚠️ ON THE ROW FOR `CP_NODE`'s REASON, not for convenience. Both are properties of
+# ONE node, and the alternative — a table of them in `exec_workflows.state` — sits
+# under `execstate.MAX_STATE_CHARS`, which degrades an over-long blob to `"{}"`. A
+# graph that lost its resource tokens would not fail: it would quietly run two
+# nodes that were declared as never allowed to overlap, which is the failure mode
+# with no error message. `kind` is likewise the only durable record of what a node
+# IS — a title is prose a model may rewrite.
+CP_KIND = "kind"
+CP_RESOURCE = "resource"
 
 STEP_PENDING = "pending"
 STEP_RUNNING = "running"
@@ -899,9 +1040,140 @@ def checkpoint_view(task_id_or_task) -> dict:
     }
 
 
+def stale_running(cwd: str = "", older_than: float = STALE_AFTER,
+                  limit: int = 50) -> list[Task]:
+    """Tasks a worker is still holding that nothing has touched for *older_than* seconds.
+
+    Task 25 §6 — worker recovery — asks exactly one question of the task model:
+    *"which tasks did a worker die holding?"* It lives here, beside
+    `unfinished_sessions()`, for the same reason that one does: what counts as
+    stuck is a property of the task model, and a `SELECT … WHERE status='running'`
+    written inside `core/recovery/` would be a second declaration of it — one that
+    keeps working and silently stops matching the day a ninth status is added.
+
+    ⚠️ `HELD` — RUNNING **AND QUEUED** — NEVER PAUSED, and those are three
+    different facts rather than degrees of one. QUEUED has a single writer,
+    `core/dag/store.claim()`, where the status write *is* the lock: `pending` →
+    `queued` comes first precisely so `dispatchable` goes False for every other
+    scheduler, and `schedule._start()` marks RUNNING milliseconds later, in the
+    pump's own thread. A process that dies inside that window used to leave a row
+    no path could recover — `heartbeat()` writes only to a RUNNING row, so it beats
+    nothing and this sweep never saw it; the status is no longer `pending`, so no
+    scheduler re-takes it; and `release_interrupted()`/`unpause_run()` both key on
+    PAUSED, so neither frees it. `_state_of` projects QUEUED onto READY, so the run
+    sat at N-1/N forever while every surface rendered the node as healthy. Sweeping
+    it is safe in the direction that matters: a legitimately-held QUEUED row is
+    RUNNING within milliseconds, orders of magnitude under `STALE_AFTER`.
+    PAUSED stays out for the opposite reason — `interrupt()` parks there and
+    `/pause` is a hold a human chose, and handing recovery every deliberately
+    paused chat is the repurposing of `/pause` Phase 8 is forbidden to do. What
+    separates the two on disk is the `CP_STOPPED` checkpoint, which `interrupt()`
+    writes and `pause()` never does.
+
+    ⚠️ THE COMPARISON IS `last_heartbeat` FIRST, `updated_at` SECOND, AND THE ORDER
+    MATTERS IN ONE DIRECTION ONLY. A long task that is genuinely working changes
+    nothing about its row for minutes at a time — same status, same progress — so
+    `updated_at` alone would call it stale and worker recovery would declare a
+    healthy task interrupted. `heartbeat()` is what a live worker writes to say
+    otherwise, so the freshest of the two is the honest answer. `created_at` is the
+    last resort: migration 27 backfills `updated_at`, but a row written by something
+    that bypassed `create()` would otherwise read as `''`, which sorts BELOW every
+    cutoff and would make that row permanently, silently "stale". A QUEUED row is
+    measured by `updated_at` alone in practice, since `heartbeat()` refuses to
+    touch anything but RUNNING — which is the honest reading, because `queue()`
+    stamped it at the moment of the claim.
+
+    ⚠️ The comparison is on second-resolution timestamps, so `older_than=0` means
+    "everything held" rather than "nothing" — a test can ask for that without
+    inserting a sleep, and a caller cannot accidentally get an empty answer from a
+    zero.
+    """
+    try:
+        secs = max(0.0, float(older_than))
+    except Exception:
+        secs = STALE_AFTER
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - secs))
+    seen = ("COALESCE(NULLIF(last_heartbeat,''), NULLIF(updated_at,''),"
+            " NULLIF(created_at,''), '')")
+    # `status IN (…)` still rides `idx_agent_tasks_live(status, updated_at)` —
+    # SQLite serves an IN list as one range scan per value — so widening the seed
+    # to `HELD` costs no extra scan on the startup path.
+    params: list = [*HELD, cutoff]
+    holds = ",".join("?" for _ in HELD)
+    where = f"status IN ({holds}) AND {seen}<=?"
+    if cwd:
+        where += " AND session_id IN (SELECT id FROM task_sessions WHERE cwd=?)"
+        params.append(_project_key(cwd))
+    params.append(_int(limit, 50))
+    rows = db.qall(
+        f"SELECT * FROM agent_tasks WHERE {where}"
+        f" ORDER BY {seen} ASC, rowid ASC LIMIT ?",
+        tuple(params),
+    )
+    return [Task.from_row(r) for r in rows]
+
+
+def heartbeat(task_id: str, *, worker_id: str = "",
+              execution_id: str = "") -> bool:
+    """Say "this task is still being worked on" — Task 24 §6's liveness signal.
+
+    ⚠️ **A STALE HEARTBEAT IS EVIDENCE, NOT A VERDICT**, which is why this writes a
+    timestamp and nothing else. §24.6 is explicit that recovery must not assume
+    failure merely because a beat is late — a machine that was asleep, a worker
+    blocked on a 10-minute `docker build`, and a process that died all produce the
+    same silence here. `core/recovery/crash.py` combines it with the owning
+    instance's pid before deciding anything.
+
+    Deliberately NOT routed through `_apply()`: a heartbeat is not a transition, and
+    passing one through the status writer would fire the `sync.notify("tasks")` that
+    repaints both surfaces — once per beat, forever, for a task that did not change.
+    It is the one write allowed to touch `updated_at` from outside `_apply`, and it
+    writes the same stamp to both columns so the two can never disagree about when
+    the row was last known good.
+
+    Cheap and total: one UPDATE, no read-back, `False` on anything unexpected.
+    """
+    if not str(task_id or ""):
+        return False
+    now = _now()
+    sets = {"last_heartbeat": now, "updated_at": now}
+    if worker_id:
+        sets["worker_id"] = _text(worker_id, MAX_TITLE)
+    if execution_id:
+        sets["execution_id"] = _text(execution_id, MAX_TITLE)
+    try:
+        cols = ", ".join(f"{k}=?" for k in sets)
+        db.exe(
+            f"UPDATE agent_tasks SET {cols} WHERE id=? AND status=?",
+            (*sets.values(), str(task_id), TaskStatus.RUNNING),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def claim(task_id: str, *, worker_id: str = "", execution_id: str = "") -> Task | None:
+    """Record WHICH worker and WHICH execution a running task belongs to (§24.3).
+
+    The two identifiers a recovery report needs in order to say more than "a task
+    was interrupted": the worker is what `recover_workers()` groups by, and the
+    execution id is the link to the `exec_commands` / `exec_tool_calls` row that
+    holds the operation itself — which is how a review panel can say *"a git_commit
+    was in flight"* rather than *"task 3 stopped"*.
+
+    Goes through `_apply()` (with the task's existing status, so it is not a
+    transition) precisely so `updated_at` bookkeeping stays in one place.
+    """
+    task = get(task_id)
+    if task is None:
+        return None
+    return _apply(task, task.status, worker_id=worker_id,
+                  execution_id=execution_id, beat=True)
+
+
 def interrupt(session_id: str, reason: str = "interrupted", *,
               pause: bool = True) -> list[Task]:
-    """Stamp every RUNNING task of *session_id* as stopped, and park it.
+    """Stamp every HELD task of *session_id* as stopped, and park it.
 
     Called on Ctrl+C, on `stop_agent`, and on a clean shutdown. Best-effort by
     design: the sub-step trail is already durable, so failing to reach this only
@@ -910,11 +1182,20 @@ def interrupt(session_id: str, reason: str = "interrupted", *,
     `pause=True` moves the task to PAUSED — an honest "started, not finished"
     that neither loses it nor claims it succeeded. PAUSED is open, so
     `unfinished_sessions()` still offers it for recovery.
+
+    ⚠️ THE FILTER IS `HELD`, NOT RUNNING, AND IT HAS TO MATCH `stale_running()`'s.
+    That sweep is what seeds `crash.recover_workers()`, and this is the only writer
+    of `CP_STOPPED` — the one durable mark that separates *a crash abandoned this*
+    from *a human paused it*, and therefore the only thing
+    `dag.store.release_interrupted()` will act on. A row the seed found and this
+    filter then skipped would be reported as interrupted and parked by nothing:
+    still QUEUED, still unrecoverable, and now with a recovery pass on record
+    saying it was handled.
     """
     out: list[Task] = []
     stamp = {"at": _now(), "reason": _text(reason, MAX_TITLE)}
     for task in list_tasks(session_id):
-        if task.status != TaskStatus.RUNNING:
+        if task.status not in HELD:
             continue
         steps = _steps_of(task.checkpoint)
         for step in steps:
@@ -947,8 +1228,11 @@ def save_checkpoint(task_id: str, data: dict, *, merge: bool = True,
     payload_ = dict(task.checkpoint) if merge else {}
     if isinstance(data, dict):
         payload_.update(data)
-    db.exe("UPDATE agent_tasks SET checkpoint=? WHERE id=?",
-           (_jdump(payload_), task.id))
+    # ⚠️ `updated_at` too: a checkpoint save IS the row changing, and it is the one
+    # write a long-running task performs most often. Omitting it here would leave a
+    # task that is checkpointing steadily looking untouched to `stale_running()`.
+    db.exe("UPDATE agent_tasks SET checkpoint=?, updated_at=? WHERE id=?",
+           (_jdump(payload_), _now(), task.id))
     if notify:
         sync.notify("tasks", session_id=task.session_id, task_id=task.id,
                     event="checkpoint")
@@ -958,6 +1242,37 @@ def save_checkpoint(task_id: str, data: dict, *, merge: bool = True,
 def load_checkpoint(task_id: str) -> dict:
     task = get(task_id)
     return dict(task.checkpoint) if task else {}
+
+
+def clear_stopped(task_id: str, *, notify: bool = True) -> Task | None:
+    """Drop the `CP_STOPPED` mark once the row it parked has been released.
+
+    ⚠️ **IT LIVES HERE BECAUSE `interrupt()` IS THE ONLY WRITER OF THAT KEY.** The
+    mark is the one durable difference between *a crash abandoned this* and *a human
+    held this* (`dag.store._stopped_of()` is its only reader), so a releaser that
+    left it behind would make the two indistinguishable **the next time round**: a
+    node freed after a crash and later paused on purpose reads PAUSED *and*
+    interrupted, and the following `release_interrupted()` un-pauses a hold somebody
+    chose. Clearing it is therefore part of releasing, not a tidy-up.
+
+    ⚠️ **`merge=False` IS LOAD-BEARING, AND SO IS RE-SEEDING FROM THE ROW.**
+    `save_checkpoint(merge=True)` can only ever add a key, so it cannot express a
+    deletion; a bare `merge=False` starts from `{}` and would blank `CP_STEPS`,
+    `CP_NODE`, `CP_WORKFLOW` and `CP_KIND` — the resume position and the node's whole
+    identity. So the surviving keys are read back and written whole.
+
+    ⚠️ An absent mark writes **nothing at all**: `save_checkpoint()` stamps
+    `updated_at`, which is exactly what `stale_running()` measures, so an idempotent
+    call must not make a parked row look freshly touched.
+    """
+    task = get(task_id)
+    if task is None:
+        return None
+    cp = dict(task.checkpoint) if isinstance(task.checkpoint, dict) else {}
+    if CP_STOPPED not in cp:
+        return task
+    cp.pop(CP_STOPPED, None)
+    return save_checkpoint(task_id, cp, merge=False, notify=notify)
 
 
 # ── The merge (`update_todo`'s durable half) ──────────────────────────────────
@@ -1025,10 +1340,17 @@ def _resolve_deps(spec, ordered: list[Task]) -> list[str]:
 
 def _renumber(ordered: list[Task]) -> None:
     """Write `seq` to match the merged order. Only rows whose seq actually moved
-    are touched, so a no-op `update_todo` costs zero writes."""
+    are touched, so a no-op `update_todo` costs zero writes.
+
+    `updated_at` moves with it, because the rule that keeps `stale_running()`
+    trustworthy is "every write to this table stamps it" — an exception for one
+    column is how the next writer learns there are exceptions.
+    """
+    now = _now()
     for i, t in enumerate(ordered):
         if t.seq != i:
-            db.exe("UPDATE agent_tasks SET seq=? WHERE id=?", (i, t.id))
+            db.exe("UPDATE agent_tasks SET seq=?, updated_at=? WHERE id=?",
+                   (i, now, t.id))
             t.seq = i
 
 
@@ -1106,6 +1428,8 @@ def sync_list(session_id: str, items, *, notify: bool = True) -> list[Task]:
                 updates.append("priority=?")
                 params.append(item["priority"])
             if updates:
+                updates.append("updated_at=?")
+                params.append(_now())
                 params.append(fresh.id)
                 db.exe(f"UPDATE agent_tasks SET {', '.join(updates)} WHERE id=?",
                        tuple(params))
@@ -1116,18 +1440,126 @@ def sync_list(session_id: str, items, *, notify: bool = True) -> list[Task]:
         _renumber(merged)
 
         # Dependencies resolve against the FINAL order, so a "step 2" reference
-        # means step 2 of the list the user is about to see.
+        # means step 2 of the list the user is about to see. `set_dependencies` is
+        # the one writer of that column; `task=`/`notify=False` keep this loop at
+        # zero extra queries and one notification for the whole merge.
         for (_task, item), fresh in zip(plan, ordered, strict=False):
             if not item["deps"]:
                 continue
             resolved = _resolve_deps(item["deps"], merged)
-            resolved = [d for d in resolved if d != fresh.id]      # no self-dep
-            if resolved != fresh.dependencies:
-                db.exe("UPDATE agent_tasks SET dependencies=? WHERE id=?",
-                       (_jdump(resolved), fresh.id))
-                fresh.dependencies = resolved
+            set_dependencies(fresh.id, resolved, task=fresh, notify=False)
 
     touch_session(session_id)
     if notify:
         sync.notify("tasks", session_id=session_id, event="synced")
     return list_tasks(session_id)
+
+
+# ── Aggregate counters (Task 28) ──────────────────────────────────────────────
+
+def stats() -> dict:
+    """Task-queue counters for `/api/health` and the metrics surface.
+
+    THE one declaration of "how is the task queue doing". `summary()` above
+    answers it for ONE session and is what the CLI panel renders; this answers it
+    for the whole database, which is a different question and the only one a
+    health endpoint can ask. A `SELECT status, COUNT(*)` written inside
+    `server/routes.py` would be a second declaration of the vocabulary — and the
+    one that keeps working while silently never counting a ninth status.
+
+    ⚠️ COUNTERS ONLY — never a title, a description, a goal, a result, an error,
+    a session id or a `cwd`. `/api/health` is reachable by anything that can
+    reach the port, and a task title is a sentence the user wrote about their own
+    work; `/api/tasks` is the authenticated route that may show it. This is the
+    same rule `permissions.counters()` and `broker.stats()` already follow.
+
+    ⚠️ `by_status` is ZERO-FILLED over `ALL_STATUSES`. A status absent from the
+    dict is indistinguishable from a status this build has never heard of, and a
+    reader that renders `by_status.get("queued")` would print nothing at all for
+    an empty queue rather than `0` — the same "absent is not zero" discipline
+    `execstate._digest()` and `llm/capabilities` are built on.
+
+    ⚠️ `stale` is `stale_running()`'s answer, never a second
+    `WHERE status IN (…) AND …`. What counts as stuck is that function's
+    declaration — the `HELD` set and the `last_heartbeat` → `updated_at` →
+    `created_at` fallback its docstring exists to explain — and a health endpoint
+    that re-derived it would disagree with worker recovery about which tasks are
+    lost. It is a *sample*:
+    `STALE_SAMPLE` bounds it, `stale_sample` reports the bound, so a reader can
+    tell "200 stale tasks" from "at least 200".
+
+    ⚠️ TOTAL. Every read is guarded and a failure answers with the empty shape,
+    because a health endpoint that raises is the one endpoint you cannot use to
+    diagnose the raise. `/api/health`'s own `_section()` would catch it and
+    report the section as an error, which is honest but strictly less useful than
+    the counters that still worked.
+    """
+    out: dict = {
+        "tasks": 0,
+        "by_status": dict.fromkeys(ALL_STATUSES, 0),
+        "open": 0,
+        "settled": 0,
+        "running": 0,
+        "checkpointed": 0,
+        "stale": 0,
+        "stale_after": STALE_AFTER,
+        "stale_sample": STALE_SAMPLE,
+        "sessions": 0,
+        "sessions_by_status": dict.fromkeys(
+            (SESSION_ACTIVE, SESSION_DONE, SESSION_ABANDONED), 0),
+        "unfinished_sessions": 0,
+    }
+
+    # ⚠️ EVERY GUARD BELOW ANSWERS WITH A VALUE, NEVER WITH `pass`. That is not a
+    # lint accommodation: `stats()` is exempted for BLE001 (a broken counter may
+    # not break a health read) and deliberately NOT for S110, so each failure has
+    # to name what it degrades to — an empty row set, a zero — right where it
+    # happens. A bare `pass` five times over would leave the caller unable to tell
+    # "no tasks" from "the count did not run", which is the one distinction a
+    # health payload is read to make.
+    def _rows(sql: str) -> list:
+        try:
+            return db.qall(sql)
+        except Exception:
+            return []
+
+    def _count(sql: str) -> int:
+        try:
+            row = db.qone(sql)
+        except Exception:
+            return 0
+        return int((row or {}).get("n") or 0)
+
+    def _len(fn) -> int:
+        try:
+            return len(fn(limit=STALE_SAMPLE))
+        except Exception:
+            return 0
+
+    for row in _rows("SELECT status, COUNT(*) AS n FROM agent_tasks"
+                     " GROUP BY status"):
+        # ⚠️ A status this build does not know is reported UNDER ITS OWN NAME,
+        # never folded through `normalize_status()` into PENDING. That mapping
+        # exists so a model's typo cannot fail a tool call; using it here would
+        # make a health payload quietly relabel rows and hide the schema drift
+        # this section is read to reveal.
+        word = str(row["status"] or "") or "?"
+        out["by_status"][word] = out["by_status"].get(word, 0) + int(row["n"])
+    counts = out["by_status"]
+    out["tasks"] = sum(counts.values())
+    out["settled"] = sum(counts.get(s, 0) for s in TERMINAL)
+    out["open"] = out["tasks"] - out["settled"]
+    out["running"] = counts.get(TaskStatus.RUNNING, 0)
+
+    out["checkpointed"] = _count("SELECT COUNT(*) AS n FROM agent_tasks"
+                                 " WHERE checkpoint NOT IN ('', '{}')")
+    out["stale"] = _len(stale_running)
+
+    for row in _rows("SELECT status, COUNT(*) AS n FROM task_sessions"
+                     " GROUP BY status"):
+        word = str(row["status"] or "") or "?"
+        table = out["sessions_by_status"]
+        table[word] = table.get(word, 0) + int(row["n"])
+    out["sessions"] = sum(out["sessions_by_status"].values())
+    out["unfinished_sessions"] = _len(unfinished_sessions)
+    return out

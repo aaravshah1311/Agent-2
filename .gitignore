@@ -67,3 +67,6 @@ Thumbs.db
 # working notes about invariants, not documentation a clone needs, and nothing in
 # the test suite or the workflows requires it to exist.
 CLAUDE.md
+
+# SDD scratch workspace (ledger, briefs, review packages) — local only
+.superpowers/

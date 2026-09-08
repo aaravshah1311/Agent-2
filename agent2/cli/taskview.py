@@ -327,3 +327,138 @@ def _render_recovery_plain(rp, rows: list, title: str) -> None:
         print(f"  {_row_styles(kind)[1]}{text}{R}")
     tone = RD if rp.needs_verification else D
     print(f"\n{tone}{_recovery_footer(rp)}{R}\n")
+
+
+# ── Crash recovery (Task 25 §9) ───────────────────────────────────────────────
+#
+# ⚠️ THIS IS A REPORT, NOT A PROMPT. Task 3's panel above asks a question and the
+# launch waits for the answer; this one states what the startup scan already
+# decided and returns. The distinction is the whole reason it is a second function
+# rather than a branch in `render_recovery`: a scan runs on EVERY launch, and a
+# launch that stopped for a confirmation whenever a previous run had crashed would
+# make an unattended start (a container, `agent2 dual`, a cron job) hang forever.
+#
+# ⚠️ AND IT PRINTS NOTHING WHEN THERE IS NOTHING TO SAY. A "recovery: 0 units"
+# line on every launch is noise, and noise on the launch path is what teaches a
+# user to skip past the line that matters. The one thing it always prints when
+# present is the review queue — those entries do not resolve on their own.
+#
+# ⚠️ NO COMMAND LINES, NO ARGUMENTS, NO PATHS. It renders `crash._payload()`
+# fields only, which is why the reason strings are our own prose. The panel is on
+# a user's screen and in their scrollback, and `run_command` argv routinely holds
+# a bearer token — the same rule the recovery log lines follow.
+
+_STATE_STYLE = {
+    "needs_review":    ("bold #f0c060", YW),
+    "recovery_failed": ("bold #ff6b6b", RD),
+    "recovered":       ("#5fd7a0", GR),
+    "recovering":      ("#c0a060", YW),
+    "verifying":       ("#8a8ab0", D),
+    "interrupted":     ("#8a8ab0", D),
+}
+
+#: What each decision means in one phrase. The decision word alone is ambiguous
+#: at a glance — "retry" reads as "it will run again", which is true only for the
+#: operations whose safety kind permits an unattended repeat.
+_DECISION_LABEL = {
+    "retry":         "queued to run again (safe to repeat)",
+    "resume":        "will continue from its checkpoint",
+    "mark_complete": "marked finished — the work was already done",
+    "review":        "WAITING FOR YOU — recovery would not guess",
+    "none":          "nothing to do",
+}
+
+
+def _crash_rows(report: dict) -> list[tuple[str, str]]:
+    """(style-key, text) rows for a `crash.report()`. Pure — no printing."""
+    from agent2.core.recovery import crash as _crash
+
+    rows: list[tuple[str, str]] = []
+    scan = report.get("last_scan") or {}
+    for entry in report.get("review") or []:
+        rows.append((entry.get("state") or "needs_review",
+                     f"⚠ {_crash.describe(entry)}"))
+        label = _DECISION_LABEL.get(entry.get("decision") or "", "")
+        if label:
+            rows.append(("sub", f"    {label}"))
+    if scan.get("recovered"):
+        bits = []
+        if scan.get("resumed"):
+            bits.append(f"{scan['resumed']} resumed")
+        if scan.get("retried"):
+            bits.append(f"{scan['retried']} to retry")
+        rows.append(("recovered",
+                     f"✓ {scan['recovered']} unit(s) recovered"
+                     + (f"  ({', '.join(bits)})" if bits else "")))
+    if scan.get("live_owner"):
+        rows.append(("sub", f"    {scan['live_owner']} left alone — the process "
+                            f"that owns it is still running"))
+    if scan.get("truncated"):
+        # ⚠️ Said out loud, always. A truncated scan looks exactly like a clean one
+        # from the counts, and "recovery found nothing" is the wrong conclusion to
+        # let a user draw from a scan that simply ran out of budget.
+        rows.append(("needs_review",
+                     "⚠ the scan hit its limit — more interrupted work remains"))
+    return rows
+
+
+def render_crash_recovery(report: dict, *, title: str = "Recovery") -> bool:
+    """Draw a `crash.report()`. Returns True if anything printed.
+
+    Never raises and never blocks: it runs on the launch path, so a display bug
+    here must not be able to stop the CLI from starting — the same contract
+    `render()` and `render_recovery()` hold.
+    """
+    try:
+        if not report or not report.get("enabled"):
+            return False
+        rows = _crash_rows(report)
+        if not rows:
+            return False
+        footer = _crash_footer(report)
+        if _RICH:
+            _render_crash_rich(rows, title, footer,
+                              bool(report.get("needs_review")))
+        else:
+            _render_crash_plain(rows, title, footer,
+                                bool(report.get("needs_review")))
+    except Exception:
+        return False
+    return True
+
+
+def _crash_footer(report: dict) -> str:
+    scan = report.get("last_scan") or {}
+    review = int(report.get("needs_review") or 0)
+    parts = [f"{int(scan.get('processed') or 0)} handled"]
+    if review:
+        parts.append(f"{review} awaiting review — /recovery")
+    if scan.get("failed"):
+        parts.append(f"{scan['failed']} recovery failure(s)")
+    return "  " + " · ".join(parts)
+
+
+def _render_crash_rich(rows: list, title: str, footer: str, urgent: bool) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    body = Text()
+    for kind, text in rows:
+        body.append(f"  {text}\n", style=_crash_style(kind)[0])
+    body.append("\n" + footer, style="bold #f0c060" if urgent else "#8a8ab0")
+    # `P.ACCENT` (hex), never `P.PU` — see this module's docstring.
+    _con.print(Panel(body, title=Text(title, style=f"bold {P.ACCENT}"),
+                     border_style="#2a2a40", padding=(0, 1)))
+
+
+def _render_crash_plain(rows: list, title: str, footer: str, urgent: bool) -> None:
+    print(f"\n  {P.PU}{B}{title}{R}")
+    for kind, text in rows:
+        print(f"  {_crash_style(kind)[1]}{text}{R}")
+    print(f"\n{YW if urgent else D}{footer}{R}\n")
+
+
+def _crash_style(kind: str) -> tuple[str, str]:
+    if kind == "sub":
+        return ("#6a6a80", D)
+    return _STATE_STYLE.get(kind, ("#8a8ab0", D))

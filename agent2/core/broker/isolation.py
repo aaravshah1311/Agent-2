@@ -63,8 +63,9 @@ second case is a leak; the first is history.
 brain across every checkout (rule 8 — nothing is taken away). It is deliberately
 NOT a `settings` row: a stored "off" is a persistent silent downgrade that
 survives every restart with nothing on screen to say so. Read at call time, not
-at import, so a test (and `/api/context`) sees the value actually in force rather
-than the one that happened to be set when the module loaded.
+at import, so a test (and `describe()`, through `broker.stats()`) sees the value
+actually in force rather than the one that happened to be set when the module
+loaded.
 
 ⚠️ WITH ISOLATION OFF, A NEW ROW IS STAMPED `SHARED` — NOT WITH THE CURRENT
 PROJECT. Writing the project key while the rule is off would mean that turning
@@ -94,8 +95,11 @@ SHARED = ""
 #: identifier it would otherwise have to interpolate and validate.
 COLUMN = "project"
 
-#: Tables this rule governs today. Phase 11's per-workspace skill state joins it.
-SCOPED_TABLES = ("memories", "rules")
+#: Tables this rule governs today. `skill_state` is Phase 11's per-workspace skill
+#: enablement (migration 29) — it reaches this rule through `core.skills.state`,
+#: which builds its reads with `scope_sql()` and its writes with `stamp()` exactly
+#: as `core.memory` does.
+SCOPED_TABLES = ("memories", "rules", "skill_state")
 
 MODE_PROJECT = "project"        # the default: this project's rows plus shared ones
 MODE_OFF = "off"               # pre-Task-23 behaviour: one global store

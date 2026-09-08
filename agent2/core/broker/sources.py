@@ -173,20 +173,25 @@ def priority_of(source: str) -> int:
 def ttl_for(source: str) -> float:
     """Seconds this source's data stays fully fresh. `0.0` = read live every turn.
 
-    ⚠️ GIT IS THE ONLY SOURCE THAT CAN SERVE DATA IT READ EARLIER, and its window
-    is read **live** from `gitstate.GIT_TTL` rather than copied here. A literal
-    `15.0` in this file would be a second declaration of that window, and the
-    failure is quiet: raise the TTL in `gitstate` and the broker keeps reporting a
-    two-minute-old snapshot as perfectly fresh.
+    ⚠️ NEITHER WINDOW IS COPIED HERE — both are read **live** from the module that
+    owns the cache (`gitstate.GIT_TTL`, `skills.discovery.SKILLS_TTL`). A literal
+    `15.0` or `5.0` in this file would be a second declaration of somebody else's
+    window, and the failure is quiet: raise the TTL over there and the broker keeps
+    reporting a two-minute-old snapshot as perfectly fresh.
 
-    Every other collector reads its facts during `collect()`, so their data is as
+    Git and skills are the only two sources that can serve data they read earlier;
+    every other collector reads its facts during `collect()`, so their data is as
     fresh as the turn. A later phase that adds a cached source either adds a branch
     here or has its collector state `freshness` itself.
     """
     try:
-        if str(source) == SOURCE_GIT:
+        key = str(source)
+        if key == SOURCE_GIT:
             from agent2.core import gitstate as _git
             return max(0.0, float(_git.GIT_TTL))
+        if key == SOURCE_SKILLS:
+            from agent2.core.skills import discovery as _disc
+            return max(0.0, float(_disc.SKILLS_TTL))
     except Exception:
         return 0.0
     return 0.0
@@ -222,6 +227,11 @@ def freshness_of(source: str, stamp: float = 0.0, *, now: float | None = None) -
     Decays linearly across the source's TTL and never below 0.0. A stamp in the
     future (clock skew, a restored snapshot) reads as fresh rather than as an
     error; there is nothing useful to do with a negative age.
+
+    Rounded to three places, exactly like `relevance_of()`: both are ordering hints
+    that a payload reports, and one of them arriving as `0.9786311467488606` while
+    the other reads `0.723` is a difference in the *report* that says nothing about
+    the measure. Three places is far finer than any tie-break `rank()` makes.
     """
     try:
         ttl = ttl_for(source)
@@ -230,7 +240,7 @@ def freshness_of(source: str, stamp: float = 0.0, *, now: float | None = None) -
         age = float(now if now is not None else time.time()) - float(stamp)
         if age <= 0.0:
             return 1.0
-        return max(0.0, min(1.0, 1.0 - (age / ttl)))
+        return round(max(0.0, min(1.0, 1.0 - (age / ttl))), 3)
     except Exception:
         return 1.0
 
