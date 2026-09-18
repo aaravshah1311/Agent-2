@@ -2,11 +2,17 @@
 # Portfolio: aaravshah1311.is-great.net
 # github: github.com/aaravshah1311
 
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: 📖 Documentation
-    url: https://github.com/Agent-2/wiki
-    about: Check our documentation for answers
-  - name: 💬 Discussions
-    url: https://github.com/Agent-2/discussions
-    about: Ask questions and share ideas
+    url: https://agent2.is-best.net/docs/
+    about: Explore 45 pages of static documentation and subsystem guides
+  - name: 💬 GitHub Discussions
+    url: https://github.com/aaravshah1311/Agent-2/discussions
+    about: Ask questions, share ideas, and showcase Agent-2 workflows
+  - name: 🤝 Contributing Guidelines
+    url: https://github.com/aaravshah1311/Agent-2/blob/main/CONTRIBUTING.md
+    about: Learn how to set up the dev environment, write tests, and submit PRs
+  - name: 🔒 Security Policy
+    url: https://github.com/aaravshah1311/Agent-2/blob/main/SECURITY.md
+    about: Review our security posture and report vulnerabilities responsibly
