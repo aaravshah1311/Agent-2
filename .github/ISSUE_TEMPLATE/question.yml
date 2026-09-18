@@ -2,8 +2,8 @@
 # Portfolio: aaravshah1311.is-great.net
 # github: github.com/aaravshah1311
 
-name: Question
-description: Ask a question about the project
+name: 💬 Question
+description: Ask a question about Agent-2 setup, configuration, or usage
 title: "[Question]: "
 labels: ["question"]
 assignees: []
@@ -11,16 +11,33 @@ body:
   - type: markdown
     attributes:
       value: |
-        Have a question? We're happy to help!
+        Have a question about Agent-2? Please check our [Documentation](https://agent2.is-best.net/docs/) first. If you still need help, feel free to submit your question below!
+  - type: dropdown
+    id: category
+    attributes:
+      label: Topic / Area
+      description: What is your question related to?
+      options:
+        - Installation & Setup
+        - API Keys & Models
+        - CLI / Slash Commands
+        - Web UI & Authentication
+        - Tasks / Workflows / UltraCode
+        - MCP Bridges & Security Tools
+        - Configuration & Environment
+        - Other
+    validations:
+      required: true
   - type: textarea
     id: question
     attributes:
       label: Your Question
-      description: What would you like to know?
+      description: What would you like to know or clarify?
+      placeholder: How do I configure...
     validations:
       required: true
   - type: textarea
     id: context
     attributes:
-      label: Additional Context
-      description: Any relevant context or what you've already tried.
+      label: Additional Context & What You've Tried
+      description: Share any relevant context, configuration options tried, or documentation reviewed.

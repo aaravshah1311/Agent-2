@@ -2,8 +2,8 @@
 # Portfolio: aaravshah1311.is-great.net
 # github: github.com/aaravshah1311
 
-name: Bug Report
-description: Report a bug or unexpected behavior
+name: 🐛 Bug Report
+description: Report a bug or unexpected behavior in Agent-2
 title: "[Bug]: "
 labels: ["bug", "needs-triage"]
 assignees: []
@@ -11,46 +11,75 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report this bug! Please fill out the information below.
+        Thanks for taking the time to report a bug! Please fill out the form below to help us investigate and fix the issue quickly.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Agent Surface
+      description: Which surface were you using when the bug occurred?
+      options:
+        - CLI (agent2cli.py)
+        - Web UI (agent2web.py)
+        - Dual Mode (agent2dual.py)
+        - Docker Container
+        - REST API / Socket.IO
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Gemini Model / Provider
+      description: Which model or provider was active?
+      options:
+        - 2.5-flash (default)
+        - 2.5-flash-lite
+        - 3.5-flash
+        - 3.5-flash-lite
+        - 3.6-flash
+        - 3.7-flash
+        - Custom Provider (OpenAI/Anthropic compatible)
+        - Not sure / N/A
   - type: textarea
     id: description
     attributes:
       label: Bug Description
-      description: A clear and concise description of the bug.
-      placeholder: Describe the bug...
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe what went wrong...
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
       label: Steps to Reproduce
-      description: Steps to reproduce the behavior.
+      description: Detailed steps to reproduce the issue.
       placeholder: |
-        1. Go to '...'
-        2. Click on '...'
-        3. See error
+        1. Run `python run.py --web`
+        2. Execute slash command `/...`
+        3. See error in terminal/browser
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
       label: Expected Behavior
-      description: What you expected to happen.
+      description: What did you expect to happen?
     validations:
       required: true
   - type: textarea
     id: actual
     attributes:
       label: Actual Behavior
-      description: What actually happened.
+      description: What actually happened?
     validations:
       required: true
   - type: input
-    id: version
+    id: python-version
     attributes:
-      label: Version
-      description: What version are you using?
-      placeholder: e.g., v1.0.0
+      label: Python Version
+      description: Version of Python running Agent-2 (e.g. 3.10.12)
+      placeholder: e.g., Python 3.11.4
+    validations:
+      required: false
   - type: dropdown
     id: os
     attributes:
@@ -59,15 +88,18 @@ body:
         - Windows
         - macOS
         - Linux
+        - Docker / Container
         - Other
+    validations:
+      required: true
   - type: textarea
     id: logs
     attributes:
-      label: Relevant Logs
-      description: Paste any relevant log output.
+      label: Relevant Logs & Output
+      description: Paste any terminal output, log files, or traceback details.
       render: shell
   - type: textarea
     id: additional
     attributes:
       label: Additional Context
-      description: Any other context about the problem.
+      description: Add any other context, configuration details, or screenshots about the problem.

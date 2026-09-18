@@ -1,0 +1,28 @@
+# Author: Aarav Shah
+# Portfolio: aaravshah1311.is-great.net
+# github: github.com/aaravshah1311
+
+name: 🛡️ Report a Security Vulnerability
+description: Learn how to responsibly disclose security vulnerabilities in Agent-2
+title: "[SECURITY]: "
+labels: ["security"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### ⚠️ DO NOT FILE A PUBLIC ISSUE FOR SECURITY VULNERABILITIES
+
+        To protect the community and user installations, **do not disclose potential security vulnerabilities publicly**.
+
+        Please report all security vulnerabilities directly via email according to our [Security Policy](https://github.com/aaravshah1311/Agent-2/blob/main/SECURITY.md):
+
+        📧 **Security Contact**: [aaravshah1311@gmail.com](mailto:aaravshah1311@gmail.com)
+
+        **Please include**:
+        - Description of the vulnerability and security impact
+        - Component affected (Web Auth, API, Shell Watchdog, Secret Storage, etc.)
+        - Step-by-step reproduction instructions or Proof-of-Concept (PoC)
+        - Environment & Agent-2 version
+
+        We will acknowledge receipt within **48 hours** and provide periodic updates as we address the issue. Thank you for keeping Agent-2 secure!
