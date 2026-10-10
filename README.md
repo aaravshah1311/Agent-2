@@ -38,7 +38,7 @@ github: github.com/aaravshah1311
 </h3>
 <p align="center">
   <sub>
-    Fluxion AI provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing—and get $3 in API credits when you sign up through this link.</sub>
+    Fluxion AI/Sidrune AI provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing—and get $3 in API credits when you sign up through this link.</sub>
     <br><br>
   <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">Click Here</a> to Avail Free Credits
 </p>
