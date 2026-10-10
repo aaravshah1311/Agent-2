@@ -25,22 +25,22 @@ github: github.com/aaravshah1311
 <tr><td>
 <p align="center">
   <strong><i>Sponsored by</i></strong><br><br>
-  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">
+  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">
     <picture>
-      <img src="pic/FluxionAI-world-banner-get-3-credit.png" width="100%">
+      <img src="pic/SidruneAI-world-banner-get-3-credit.png" width="100%">
     </picture>
   </a>
 </p>
 
 
 <h3 align="center">
-  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">Fluxion AI - Reliable, cost-efficient access to GPT, Claude, and other leading AI models</a>
+  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">Fluxion AI/Sidrune AI - Reliable, cost-efficient access to GPT, Claude, and other leading AI models</a>
 </h3>
 <p align="center">
   <sub>
     Fluxion AI provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing—and get $3 in API credits when you sign up through this link.</sub>
     <br><br>
-  <a href="https://fluxionai.world/register?source=github&campaign=github-agent-2&promo=AGENT2">Click Here</a> to Avail Free Credits
+  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">Click Here</a> to Avail Free Credits
 </p>
 </td></tr>
 </table>
