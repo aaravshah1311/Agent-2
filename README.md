@@ -19,6 +19,7 @@ github: github.com/aaravshah1311
   <img src="https://img.shields.io/badge/SQLite-single_file_state-003B57?style=for-the-badge&logo=sqlite&logoColor=white" />
   <img src="https://img.shields.io/badge/Tests-2670-3ddc84?style=for-the-badge&logo=pytest&logoColor=white" />
   <img src="https://img.shields.io/badge/Status-Active-3ddc84?style=for-the-badge" />
+  <img src="https://hits.sh/github.com/aaravshah1311/Agent-2.svg?style=for-the-badge&label=REPOSITORY+VIEWS&color=00ff88" alt="Repository Views" />
 </p>
 <p align="center">
  <a href="https://www.star-history.com/aaravshah1311/agent-2">
