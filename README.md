@@ -20,7 +20,15 @@ github: github.com/aaravshah1311
   <img src="https://img.shields.io/badge/Tests-2670-3ddc84?style=for-the-badge&logo=pytest&logoColor=white" />
   <img src="https://img.shields.io/badge/Status-Active-3ddc84?style=for-the-badge" />
 </p>
-
+<p align="center">
+ <a href="https://www.star-history.com/aaravshah1311/agent-2">
+  <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=aaravshah1311/Agent-2&type=rank&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=aaravshah1311/Agent-2&type=rank" />
+   <img alt="Star History Rank" src="https://api.star-history.com/badge?repo=aaravshah1311/Agent-2&type=rank" />
+  </picture>
+ </a>
+</p>
 <table align="center" width="100%">
 <tr><td>
 <p align="center">
