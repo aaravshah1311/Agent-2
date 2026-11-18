@@ -32,25 +32,13 @@ github: github.com/aaravshah1311
 </p>
 <table align="center" width="100%">
 <tr><td>
-<p align="center">
-  <strong><i>Sponsored by</i></strong><br><br>
-  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">
-    <picture>
-      <img src="pic/SidruneAI-world-banner-get-3-credit.png" width="100%">
-    </picture>
-  </a>
-</p>
-
-
-<h3 align="center">
-  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">Fluxion AI/Sidrune AI - Reliable, cost-efficient access to GPT, Claude, and other leading AI models</a>
-</h3>
-<p align="center">
-  <sub>
-    Fluxion AI/Sidrune AI provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing—and get $3 in API credits when you sign up through this link.</sub>
-    <br><br>
-  <a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2">Click Here</a> to Avail Free Credits
-</p>
+<strong><i> Past Sponsor</i></strong><br><br>
+<table align="center">
+  <tr>
+    <td align="center" width="104"><a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2" target="_blank"><img src="sidrune-ai.png" alt="Sidrune AI" width="80" height="80" /></a></td>
+    <td><sub><a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-agent-2&promo=SDRAGENT2" target="_blank"><strong>Sidrune AI</strong></a> provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API.<br />Save up to 70% compared with official API pricing and get $3 in API credits when you sign up through this link.</sub></td>
+  </tr>
+</table>
 </td></tr>
 </table>
 
